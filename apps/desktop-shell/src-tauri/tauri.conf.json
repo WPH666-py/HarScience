@@ -1,0 +1,53 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Harness-CN",
+  "version": "0.2.1-rc.15",
+  "identifier": "com.harnesscn.desktop",
+  "build": {
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' http://127.0.0.1:*; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self'; script-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis",
+      "msi"
+    ],
+    "publisher": "水哥",
+    "copyright": "青岛理工大学2022级毕业生水哥",
+    "shortDescription": "图形化、平替化、Harness化，就选 Harness-CN！",
+    "icon": [
+      "icons/icon.ico"
+    ],
+    "resources": [
+      "resources/runtime",
+      "resources/shell",
+      "resources/sidecar"
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": [
+          "SimpChinese",
+          "English"
+        ],
+        "installerIcon": "icons/icon.ico",
+        "installerHooks": "hooks.nsh"
+      },
+      "wix": {
+        "version": "0.2.1-rc.15",
+        "language": "zh-CN"
+      }
+    }
+  }
+}

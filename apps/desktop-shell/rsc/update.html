@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>发现新版本</title>
+    <link rel="stylesheet" href="./update.css" />
+  </head>
+  <body>
+    <main class="update">
+      <header class="update-hero">
+        <div class="update-hero-icon" aria-hidden="true">🎉</div>
+        <div class="update-hero-text">
+          <div class="update-hero-title">发现新版本</div>
+          <div class="update-hero-sub">从 Gitee 一键升级，全程无窗口</div>
+        </div>
+      </header>
+
+      <div class="update-body">
+        <div class="update-versions">
+          <div class="update-ver-chip cur">
+            <span class="update-ver-label">当前</span>
+            <span class="update-ver-num" id="current">—</span>
+          </div>
+          <div class="update-arrow" aria-hidden="true">→</div>
+          <div class="update-ver-chip new">
+            <span class="update-ver-label">最新</span>
+            <span class="update-ver-num" id="version">—</span>
+          </div>
+        </div>
+
+        <div class="update-meta">
+          <span class="update-chip" id="size" hidden></span>
+          <span class="update-chip" id="published" hidden></span>
+          <span class="update-chip ok">🔒 退出即自动卸载旧版 → 静默安装 → 自动重启</span>
+        </div>
+
+        <div class="update-progress" id="progress" hidden>
+          <div class="update-progress-head">
+            <span class="update-progress-phase" id="phase">正在从 Gitee 下载</span>
+            <span class="update-progress-pct" id="percent"></span>
+          </div>
+          <div class="update-progress-bar">
+            <div class="update-progress-fill" id="bar"></div>
+          </div>
+          <div class="update-progress-note" id="note"></div>
+        </div>
+
+        <div class="update-notes" id="notes-block" hidden>
+          <div class="update-notes-title">📋 更新内容</div>
+          <pre class="update-notes-body" id="notes"></pre>
+        </div>
+
+        <div class="update-hint" id="hint">
+          选择「暂不更新」后本次启动不再提示；下次打开还会再问一次。
+        </div>
+      </div>
+
+      <footer class="update-actions">
+        <button type="button" class="update-btn ghost" id="skip">暂不更新</button>
+        <button type="button" class="update-btn primary" id="install">立即更新</button>
+      </footer>
+    </main>
+
+    <script type="module" src="./update.js"></script>
+  </body>
+</html>

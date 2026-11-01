@@ -1,0 +1,757 @@
+/** Deterministic archive transport for the desktop seed's pnpm store. */
+
+import { createHash } from 'node:crypto'
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
+import { copyFile, link } from 'node:fs/promises'
+import { dirname, join, posix, relative, sep } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
+import { create, extract } from 'tar'
+import { COOPERATIVE_BATCH_ENTRIES, yieldToEventLoop } from './event-loop.ts'
+import { renameOwnedDirectory } from './owned-directory.ts'
+
+/** Directory containing the seed's uncompressed pnpm store archives. */
+export const SEED_STORE_ARCHIVE_DIR = 'store-archives'
+
+/** Manifest describing the deterministic pnpm store archive set. */
+export const SEED_STORE_ARCHIVE_MANIFEST = 'store-archives.json'
+
+/** Seed file mapping every installed profile entry that is a hard link into the pnpm store. */
+export const SEED_PROFILE_LINK_MANIFEST = 'profile-links.json'
+
+/** Seed archive carrying every installed profile entry the pnpm store does not own. */
+export const SEED_PROFILE_FILE_ARCHIVE = 'profile-files.tar'
+
+const DEFAULT_SHARD_COUNT = 16
+
+/**
+ * How many store archives are unpacked at once.
+ *
+ * Sixteen shards of ~18 MB each, and the work is per-file: a shard spends its time creating
+ * entries, not moving bytes. Running them together therefore overlaps the latency the filesystem
+ * and any on-access scanner charge for each new file, which is what dominates this step. The bound
+ * is the shard count itself: the shards are disjoint by construction, so there is no reason to
+ * hold one back, and a lower bound would leave the disk idle at the end of every pass while the
+ * last few archives finished on their own.
+ */
+const EXTRACTION_CONCURRENCY = 16
+const ARCHIVE_NAME_PATTERN = /^store-[0-9a-f]{2}\.tar$/u
+const STORE_VERSION_PATTERN = /^v\d+$/u
+
+/**
+ * Store paths whose file name is the file's own content digest.
+ *
+ * pnpm addresses the store this way, so an entry that is already present holds exactly these
+ * bytes and needs no write. That matters because replacing a store file is not a rewrite in
+ * place: the old entry is unlinked and a new one created, and a scanner that inspects every
+ * created file turns that into the slowest part of publishing a refreshed store.
+ */
+const CONTENT_ADDRESSED_STORE_PATTERN = /^v\d+\/files\//u
+
+interface SeedStoreArchiveRecord {
+  readonly file: string
+  readonly entries: number
+}
+
+interface SeedStoreArchiveManifest {
+  readonly schemaVersion: 1
+  readonly shardCount: number
+  readonly archives: readonly SeedStoreArchiveRecord[]
+}
+
+/** Manifest mapping one installed profile tree onto the files a pnpm store owns. */
+interface SeedProfileLinkManifest {
+  readonly schemaVersion: 1
+  readonly links: Readonly<Record<string, string>>
+}
+
+/** What one profile archive recorded, for the build log and its own gates. */
+export interface LinkedProfileArchiveSummary {
+  /** Profile entries recorded as links into the pnpm store. */
+  readonly linkedFiles: number
+  /** Profile entries the archive carries verbatim. */
+  readonly archivedFiles: number
+  /** Profile directories the archive carries. */
+  readonly archivedDirectories: number
+}
+
+function storeFiles(storeRoot: string): readonly string[] {
+  const files: string[] = []
+  const visit = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name)
+      if (entry.isSymbolicLink()) {
+        throw new Error(`desktop seed: pnpm store contains a symbolic link: ${relative(storeRoot, path)}`)
+      }
+      if (entry.isDirectory()) {
+        visit(path)
+        continue
+      }
+      if (!entry.isFile()) {
+        throw new Error(`desktop seed: pnpm store contains an unsupported file: ${relative(storeRoot, path)}`)
+      }
+      files.push(relative(storeRoot, path).split(sep).join('/'))
+    }
+  }
+  visit(storeRoot)
+  return files.sort((left, right) => left.localeCompare(right))
+}
+
+function shardFor(path: string, shardCount: number): number {
+  return createHash('sha256').update(path).digest().readUInt32BE(0) % shardCount
+}
+
+function readArchiveManifest(seedRoot: string): SeedStoreArchiveManifest {
+  const path = join(seedRoot, SEED_STORE_ARCHIVE_MANIFEST)
+  const value = JSON.parse(readFileSync(path, 'utf8')) as unknown
+  if (typeof value !== 'object' || value === null) {
+    throw new Error(`desktop seed: invalid pnpm store archive manifest ${path}`)
+  }
+  const candidate = value as Record<string, unknown>
+  if (candidate.schemaVersion !== 1 || !Number.isSafeInteger(candidate.shardCount)
+    || (candidate.shardCount as number) < 1 || (candidate.shardCount as number) > 256
+    || !Array.isArray(candidate.archives) || candidate.archives.length === 0) {
+    throw new Error(`desktop seed: invalid pnpm store archive manifest ${path}`)
+  }
+  const names = new Set<string>()
+  const archives = candidate.archives.map((entry): SeedStoreArchiveRecord => {
+    if (typeof entry !== 'object' || entry === null) {
+      throw new Error(`desktop seed: invalid pnpm store archive record in ${path}`)
+    }
+    const record = entry as Record<string, unknown>
+    if (typeof record.file !== 'string' || !ARCHIVE_NAME_PATTERN.test(record.file)
+      || names.has(record.file) || !Number.isSafeInteger(record.entries) || (record.entries as number) < 1) {
+      throw new Error(`desktop seed: invalid pnpm store archive record in ${path}`)
+    }
+    const shard = Number.parseInt(record.file.slice('store-'.length, -'.tar'.length), 16)
+    if (shard >= (candidate.shardCount as number)) {
+      throw new Error(`desktop seed: pnpm store archive shard is outside the manifest range in ${path}`)
+    }
+    names.add(record.file)
+    return { file: record.file, entries: record.entries as number }
+  })
+  return {
+    schemaVersion: 1,
+    shardCount: candidate.shardCount as number,
+    archives,
+  }
+}
+
+function assertArchivePath(path: string): void {
+  if (path === '' || path.startsWith('/') || path.includes('\\') || path.includes('\0')
+    || path.split('/').some(part => part === '' || part === '.' || part === '..')) {
+    throw new Error(`desktop seed: unsafe pnpm store archive path ${JSON.stringify(path)}`)
+  }
+}
+
+/**
+ * Remove pnpm's registrations for projects that populated the seed store.
+ * @param storeRoot - pnpm store directory included in the desktop seed.
+ */
+export function removePnpmProjectRegistrations(storeRoot: string): void {
+  for (const entry of readdirSync(storeRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !/^v\d+$/u.test(entry.name)) continue
+    rmSync(join(storeRoot, entry.name, 'projects'), { recursive: true, force: true })
+  }
+}
+
+/**
+ * Remove pnpm's transient staging directories from the store that ships in the seed.
+ *
+ * pnpm works inside `<store>/v<version>/tmp`: it extracts an archive there before publishing the
+ * content-addressed files, and it keeps the packed form of a git dependency there. A `github:` spec
+ * — which a bundled plugin can be — leaves those trees behind, hard-linked to the store's own
+ * content. tar records a hard link as a `Link` entry, and the first launch refuses any store entry
+ * that is not a file, so a seed carrying them installs nowhere. Nothing links into them: every
+ * profile link names a path under `files/`.
+ * @param storeRoot - pnpm store directory included in the desktop seed.
+ */
+export function removePnpmStagingDirectories(storeRoot: string): void {
+  for (const entry of readdirSync(storeRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !/^v\d+$/u.test(entry.name)) continue
+    rmSync(join(storeRoot, entry.name, 'tmp'), { recursive: true, force: true })
+  }
+}
+
+function mergeStoreIndex(source: string, destination: string): void {
+  if (!existsSync(destination)) {
+    copyFileSync(source, destination)
+    return
+  }
+  const database = new DatabaseSync(destination)
+  let attached = false
+  try {
+    database.exec('PRAGMA busy_timeout=5000')
+    database.prepare('ATTACH DATABASE ? AS seed').run(source)
+    attached = true
+    database.exec('BEGIN IMMEDIATE')
+    let committed = false
+    try {
+      database.exec('INSERT OR REPLACE INTO package_index (key, data) SELECT key, data FROM seed.package_index')
+      database.exec('COMMIT')
+      committed = true
+    } finally {
+      if (!committed) database.exec('ROLLBACK')
+    }
+  } finally {
+    if (attached) database.exec('DETACH DATABASE seed')
+    database.close()
+  }
+}
+
+/**
+ * Merge a completely extracted seed store into Desktop's persistent pnpm store.
+ *
+ * An absent destination is published by moving the verified extraction into place. Both trees
+ * live under the same Desktop root, so that move costs one directory rename instead of
+ * rewriting every store file; the move retries the transient Windows refusals a just-written
+ * tree attracts, and anything it cannot move still falls through to the copy below. A
+ * destination that already holds a store receives only the entries it is missing, which is
+ * what keeps a refresh cheap and preserves the packages user plugins brought in.
+ * @param source - Verified temporary store extraction.
+ * @param destination - Desktop-owned persistent pnpm store.
+ * @param onProgress - receives the merged fraction so a caller can show real progress.
+ */
+export async function mergePnpmStore(
+  source: string,
+  destination: string,
+  onProgress?: (fraction: number) => void,
+): Promise<void> {
+  mkdirSync(dirname(destination), { recursive: true, mode: 0o700 })
+  if (!existsSync(destination)) {
+    try {
+      renameOwnedDirectory(source, destination)
+      onProgress?.(1)
+      return
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code !== 'EPERM' && code !== 'EACCES' && code !== 'EBUSY' && code !== 'ENOTEMPTY' && code !== 'EXDEV') {
+        throw error
+      }
+    }
+  }
+  mkdirSync(destination, { recursive: true, mode: 0o700 })
+  const indexPaths = readdirSync(source, { withFileTypes: true })
+    .filter(entry => entry.isDirectory() && STORE_VERSION_PATTERN.test(entry.name)
+      && existsSync(join(source, entry.name, 'index.db')))
+    .map(entry => `${entry.name}/index.db`)
+  await copyStoreEntries(source, destination, new Set(indexPaths), onProgress)
+  for (const path of indexPaths) {
+    mergeStoreIndex(join(source, ...path.split('/')), join(destination, ...path.split('/')))
+  }
+}
+
+/**
+ * Copy the entries one store tree has that another does not.
+ *
+ * A content-addressed entry that is already present is left untouched: its name is its
+ * digest, and the size check only guards against a copy an earlier run left half-written.
+ *
+ * Copies are issued in concurrent batches. The work is one file per entry, so overlapping
+ * them costs nothing and hides the per-entry latency Windows charges for each new name,
+ * which is what dominates this pass on a cold machine. Two entries in a batch are two
+ * different paths, so a batch cannot race itself.
+ * @param source - extracted seed store.
+ * @param destination - persistent store that receives the missing entries.
+ * @param skipped - store-relative paths the caller merges itself, such as `index.db`.
+ * @param onProgress - receives the examined fraction so a caller can show real progress.
+ */
+async function copyStoreEntries(
+  source: string,
+  destination: string,
+  skipped: ReadonlySet<string>,
+  onProgress?: (fraction: number) => void,
+): Promise<void> {
+  const directories: string[] = []
+  const files: string[] = []
+  const visit = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name)
+      const relativePath = relative(source, path).split(sep).join('/')
+      if (skipped.has(relativePath)) continue
+      if (entry.isSymbolicLink()) {
+        throw new Error(`desktop seed: pnpm store contains a symbolic link: ${relativePath}`)
+      }
+      if (entry.isDirectory()) {
+        directories.push(relativePath)
+        visit(path)
+        continue
+      }
+      if (!entry.isFile()) {
+        throw new Error(`desktop seed: pnpm store contains an unsupported file: ${relativePath}`)
+      }
+      files.push(relativePath)
+    }
+  }
+  visit(source)
+  for (const directory of directories) {
+    mkdirSync(join(destination, ...directory.split('/')), { recursive: true, mode: 0o700 })
+  }
+  let examined = 0
+  for (let start = 0; start < files.length; start += COOPERATIVE_BATCH_ENTRIES) {
+    await Promise.all(files.slice(start, start + COOPERATIVE_BATCH_ENTRIES).map(async (relativePath) => {
+      const from = join(source, ...relativePath.split('/'))
+      const to = join(destination, ...relativePath.split('/'))
+      if (needsStoreCopy(relativePath, from, to)) await copyFile(from, to)
+    }))
+    examined += COOPERATIVE_BATCH_ENTRIES
+    onProgress?.(Math.min(examined / files.length, 1))
+    await yieldToEventLoop()
+  }
+  onProgress?.(1)
+}
+
+function needsStoreCopy(relativePath: string, source: string, destination: string): boolean {
+  if (!existsSync(destination)) return true
+  if (!CONTENT_ADDRESSED_STORE_PATTERN.test(relativePath)) return true
+  return statSync(source).size !== statSync(destination).size
+}
+
+/**
+ * Replace a prepared loose pnpm store with deterministic uncompressed archive shards.
+ * @param seedRoot - seed directory that owns the archive output.
+ * @param storeRoot - populated pnpm store to archive and remove after success.
+ * @param shardCount - stable shard count used to limit update churn.
+ */
+export function archivePnpmStore(
+  seedRoot: string,
+  storeRoot: string,
+  shardCount = DEFAULT_SHARD_COUNT,
+): void {
+  if (!Number.isSafeInteger(shardCount) || shardCount < 1 || shardCount > 256) {
+    throw new Error(`desktop seed: invalid pnpm store shard count ${shardCount}`)
+  }
+  const archiveRoot = join(seedRoot, SEED_STORE_ARCHIVE_DIR)
+  const manifestPath = join(seedRoot, SEED_STORE_ARCHIVE_MANIFEST)
+  rmSync(archiveRoot, { recursive: true, force: true })
+  rmSync(manifestPath, { force: true })
+  mkdirSync(archiveRoot, { recursive: true })
+  const shards = Array.from({ length: shardCount }, (): string[] => [])
+  for (const path of storeFiles(storeRoot)) (shards[shardFor(path, shardCount)] as string[]).push(path)
+  const archives: SeedStoreArchiveRecord[] = []
+  for (const [index, paths] of shards.entries()) {
+    if (paths.length === 0) continue
+    const file = `store-${index.toString(16).padStart(2, '0')}.tar`
+    create({
+      cwd: storeRoot,
+      file: join(archiveRoot, file),
+      noDirRecurse: true,
+      noMtime: true,
+      portable: true,
+      sync: true,
+    }, paths)
+    chmodSync(join(archiveRoot, file), 0o644)
+    archives.push({ file, entries: paths.length })
+  }
+  if (archives.length === 0) throw new Error('desktop seed: pnpm store is empty')
+  writeFileSync(manifestPath, `${JSON.stringify({ schemaVersion: 1, shardCount, archives }, undefined, 2)}\n`)
+  rmSync(storeRoot, { recursive: true })
+}
+
+/**
+ * Validate and extract a packaged pnpm store archive set into an empty directory.
+ *
+ * One `extract` pass validates and writes. node-tar calls the filter with each entry's raw
+ * archive path before that entry reaches the filesystem, so the entry type, path, shard, and
+ * duplicate checks run there instead of in a preceding `list` pass over the same bytes. A
+ * rejected entry is refused and its reason kept, so a bad archive fails the extraction before it
+ * is published; the destination is a disposable extraction directory the caller discards with its
+ * transaction, which is what makes a half-written pass safe to abandon.
+ *
+ * The archives are unpacked concurrently, so this is one of the few places where the seed's own
+ * structure decides how long a first launch takes: sixteen independent shards can fill the disk's
+ * latency together, and the progress reported is the share of shards that have finished.
+ * @param seedRoot - verified packaged seed directory.
+ * @param destination - empty Desktop-owned temporary extraction directory.
+ * @param onProgress - completed fraction of the archive set, from 0 through 1.
+ */
+export async function extractPnpmStoreArchives(
+  seedRoot: string,
+  destination: string,
+  onProgress?: (fraction: number) => void,
+): Promise<void> {
+  const manifest = readArchiveManifest(seedRoot)
+  const archiveRoot = join(seedRoot, SEED_STORE_ARCHIVE_DIR)
+  const actualFiles = readdirSync(archiveRoot, { withFileTypes: true }).map((entry) => {
+    if (!entry.isFile() || entry.isSymbolicLink()) {
+      throw new Error(`desktop seed: invalid pnpm store archive entry ${entry.name}`)
+    }
+    return entry.name
+  }).sort()
+  const expectedFiles = manifest.archives.map(archive => archive.file).sort()
+  if (JSON.stringify(actualFiles) !== JSON.stringify(expectedFiles)) {
+    throw new Error('desktop seed: pnpm store archive set does not match its manifest')
+  }
+  if (existsSync(destination) && readdirSync(destination).length !== 0) {
+    throw new Error(`desktop seed: pnpm store extraction directory is not empty: ${destination}`)
+  }
+  mkdirSync(destination, { recursive: true, mode: 0o700 })
+  const paths = new Set<string>()
+  // The shards are disjoint by construction — the filter below re-checks that every entry belongs
+  // to the shard it was found in — so several can be unpacksed at the same time. They are unpacked
+  // concurrently because this work is dominated by per-file cost rather than by bytes: 22,399 files
+  // across sixteen archives land far sooner with several archives in flight than when each one is
+  // finished before the next begins.
+  let unpacked = 0
+  // A filter that throws under the asynchronous form of `extract` does not reject the promise it
+  // returns: node-tar is being driven by a stream at that point, so the throw leaves through the
+  // stream and the pass never settles. The filter therefore refuses a bad entry and records why,
+  // and the violation is raised once the pass returns, which keeps the same rejection and the same
+  // message as a throwing filter while leaving the awaited promise accountable for it.
+  let violation: Error | undefined
+  const reject = (error: unknown): false => {
+    violation ??= error instanceof Error ? error : new Error(String(error))
+    return false
+  }
+  const queue = [...manifest.archives]
+  const workers = Array.from({ length: Math.min(EXTRACTION_CONCURRENCY, queue.length) }, async () => {
+    for (;;) {
+      const archive = queue.shift()
+      if (archive === undefined) return
+      // An archive already rejected by another worker has no work left to do: the caller discards
+      // the whole extraction, so unpacking the rest of the set would only delay the failure.
+      if (violation !== undefined) return
+      const archivePath = join(archiveRoot, archive.file)
+      const archiveShard = Number.parseInt(archive.file.slice('store-'.length, -'.tar'.length), 16)
+      let entries = 0
+      await extract({
+        chmod: true,
+        cwd: destination,
+        file: archivePath,
+        filter: (path, entry) => {
+          if (violation !== undefined) return false
+          if (!('type' in entry)) return reject(new Error('desktop seed: pnpm store archive entry was not parsed'))
+          if (entry.type !== 'File' && entry.type !== 'OldFile') {
+            return reject(new Error(`desktop seed: unsupported pnpm store archive entry type ${entry.type}`))
+          }
+          try {
+            assertArchivePath(path)
+          } catch (error) {
+            return reject(error)
+          }
+          if (shardFor(path, manifest.shardCount) !== archiveShard) {
+            return reject(new Error(`desktop seed: pnpm store path is assigned to the wrong archive shard: ${path}`))
+          }
+          if (paths.has(path)) {
+            return reject(new Error(`desktop seed: duplicate pnpm store archive path ${path}`))
+          }
+          paths.add(path)
+          entries += 1
+          return true
+        },
+        noMtime: true,
+        preservePaths: false,
+        processUmask: 0,
+        strict: true,
+      })
+      if (violation !== undefined) return
+      if (entries !== archive.entries) {
+        violation = new Error(`desktop seed: pnpm store archive ${archive.file} has an unexpected entry count`)
+        return
+      }
+      unpacked += 1
+      onProgress?.(unpacked / manifest.archives.length)
+    }
+  })
+  // Every worker is awaited before any failure is raised: the caller removes the extraction
+  // directory as soon as this rejects, and a worker still writing into it would turn one clear
+  // failure into a second, misleading one about a directory that was taken away underneath it.
+  const results = await Promise.allSettled(workers)
+  if (violation !== undefined) throw violation
+  const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
+  if (failed !== undefined) throw failed.reason
+}
+
+/**
+ * Store-relative path one file's bytes occupy in a pnpm store.
+ *
+ * pnpm names a stored file after its own content: the digest's first two hex characters are
+ * the bucket directory and the rest is the file name. Matching on content rather than on file
+ * identity is what makes the mapping safe to build — an inode number is a 64-bit value on
+ * Windows that Node reports as a double, so two unrelated files can share one, and a wrong
+ * pairing would put another file's bytes into the rebuilt tree.
+ * @param storeVersion - store version directory, for example `v11`.
+ * @param body - file bytes to address.
+ * @returns store-relative path, or undefined when the store version is not the digests' owner.
+ */
+function contentAddressedStorePath(storeVersion: string, body: Buffer): string {
+  const digest = createHash('sha512').update(body).digest('hex')
+  return `${storeVersion}/files/${digest.slice(0, 2)}/${digest.slice(2)}`
+}
+
+/** Store version directory of one populated pnpm store. */
+function storeVersionDirectory(storeRoot: string): string {
+  const versions = readdirSync(storeRoot, { withFileTypes: true })
+    .filter(entry => entry.isDirectory() && STORE_VERSION_PATTERN.test(entry.name))
+    .map(entry => entry.name)
+    .sort()
+  if (versions.length !== 1) {
+    throw new Error(`desktop seed: pnpm store ${storeRoot} holds ${String(versions.length)} version directories`)
+  }
+  return versions[0] as string
+}
+
+/**
+ * Replace one installed profile tree with a link manifest plus an archive of what the store
+ * does not own.
+ *
+ * pnpm materializes a hoisted tree by hard-linking store files, so almost every installed
+ * profile file is already a store file the seed ships. Recording that relationship lets a
+ * first launch rebuild the tree by linking instead of installing: one `linkSync` costs about
+ * a fifth of one extracted file on Windows, and the shared bytes never enter the seed twice.
+ *
+ * Every recorded path is relative to the profile root rather than to `node_modules`, because
+ * tar reads a path beginning with `@` as a file listing further paths to pack —and a scoped
+ * package (`@scope/name/...`) is exactly such a path.
+ *
+ * The manifest is built from the store as it will ship, after signing and registration
+ * cleanup, so no recorded link can dangle at install time.
+ * @param seedRoot - seed directory that owns the manifest and archive output.
+ * @param storeRoot - populated pnpm store the profile tree links into.
+ * @param profileRoot - installed profile whose `node_modules` the manifest describes.
+ * @returns what the manifest and archive recorded.
+ */
+export function archiveLinkedProfile(
+  seedRoot: string,
+  storeRoot: string,
+  profileRoot: string,
+): LinkedProfileArchiveSummary {
+  const storeVersion = storeVersionDirectory(storeRoot)
+  const links: Record<string, string> = {}
+  const archived: string[] = []
+  let archivedFiles = 0
+  let archivedDirectories = 0
+  const visit = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name)
+      const relativePath = relative(profileRoot, path).split(sep).join('/')
+      if (entry.isSymbolicLink()) {
+        throw new Error(`desktop seed: installed profile contains a symbolic link: ${relativePath}`)
+      }
+      if (entry.isDirectory()) {
+        archived.push(relativePath)
+        archivedDirectories += 1
+        visit(path)
+        continue
+      }
+      if (!entry.isFile()) {
+        throw new Error(`desktop seed: installed profile contains an unsupported entry: ${relativePath}`)
+      }
+      // The store publishes these bytes under this exact name, or publishes them nowhere: a
+      // file the install generated itself carries no store entry and ships in the archive.
+      const storePath = contentAddressedStorePath(storeVersion, readFileSync(path))
+      if (existsSync(join(storeRoot, ...storePath.split('/')))) {
+        links[relativePath] = storePath
+      } else {
+        archived.push(relativePath)
+        archivedFiles += 1
+      }
+    }
+  }
+  visit(join(profileRoot, 'node_modules'))
+  const linkedFiles = Object.keys(links).length
+  if (linkedFiles === 0) {
+    throw new Error('desktop seed: installed profile shares no file with the pnpm store')
+  }
+  writeFileSync(
+    join(seedRoot, SEED_PROFILE_LINK_MANIFEST),
+    `${JSON.stringify({ schemaVersion: 1, links } satisfies SeedProfileLinkManifest)}\n`,
+  )
+  const archivePath = join(seedRoot, SEED_PROFILE_FILE_ARCHIVE)
+  rmSync(archivePath, { force: true })
+  create({
+    cwd: profileRoot,
+    file: archivePath,
+    noDirRecurse: true,
+    noMtime: true,
+    portable: true,
+    sync: true,
+  }, archived.sort((left, right) => left.localeCompare(right)))
+  return { linkedFiles, archivedFiles, archivedDirectories }
+}
+
+function readProfileLinkManifest(seedRoot: string): SeedProfileLinkManifest {
+  const path = join(seedRoot, SEED_PROFILE_LINK_MANIFEST)
+  const value = JSON.parse(readFileSync(path, 'utf8')) as unknown
+  if (typeof value !== 'object' || value === null) {
+    throw new Error(`desktop seed: invalid profile link manifest ${path}`)
+  }
+  const candidate = value as Record<string, unknown>
+  const links = candidate.links
+  if (candidate.schemaVersion !== 1 || typeof links !== 'object' || links === null || Array.isArray(links)) {
+    throw new Error(`desktop seed: invalid profile link manifest ${path}`)
+  }
+  const entries = Object.entries(links as Record<string, unknown>)
+  if (entries.length === 0) throw new Error(`desktop seed: profile link manifest ${path} records no links`)
+  for (const [profilePath, storePath] of entries) {
+    assertArchivePath(profilePath)
+    if (typeof storePath !== 'string') {
+      throw new Error(`desktop seed: invalid profile link target for ${profilePath} in ${path}`)
+    }
+    assertArchivePath(storePath)
+  }
+  return { schemaVersion: 1, links: links as Record<string, string> }
+}
+
+/** The two path facts pnpm's record has to agree with the installed tree about. */
+type RecordedPathKey = 'storeDir' | 'virtualStoreDir'
+
+/**
+ * Replace one recorded path fact, keeping the comma that ends its line.
+ * @param content - text of pnpm's `.modules.yaml`.
+ * @param key - path fact to replace.
+ * @param value - absolute path this tree actually occupies.
+ * @returns the record with that line rewritten, or the original text when it records no such fact.
+ */
+function rewriteRecordedPath(content: string, key: RecordedPathKey, value: string): string {
+  const line = new RegExp(`^([ \\t]*)"?${key}"?[ \\t]*:[^\\n]*$`, 'mu')
+  const match = line.exec(content)
+  if (match === null) return content
+  const ending = match[0].endsWith(',') ? ',' : ''
+  return content.replace(line, `${match[1] ?? ''}"${key}": ${JSON.stringify(value)}${ending}`)
+}
+
+/**
+ * Give back the comma an older rewrite of this record deleted.
+ *
+ * The record is JSON, and a rewrite that replaced the whole line also deleted the comma
+ * ending it, after which pnpm refuses the tree with `missed comma between flow collection
+ * entries`. Seeds built by those releases carry the damaged record, so a tree built from one
+ * has to be repaired here rather than only written correctly from now on.
+ * @param content - text of pnpm's `.modules.yaml`.
+ * @param key - path fact whose line may be missing its comma.
+ * @returns the record with the comma restored, or the original text when it is already correct.
+ */
+function restoreRecordedComma(content: string, key: RecordedPathKey): string {
+  return content.replace(
+    new RegExp(`^([ \\t]*"?${key}"?[ \\t]*:[^\\n]*[^,\\n])(\\r?\\n[ \\t]*")`, 'mu'),
+    '$1,$2',
+  )
+}
+
+/**
+ * Point one materialized tree's pnpm record at the locations it actually occupies.
+ *
+ * The archived tree records the build-time store and the temporary directory pnpm installed
+ * it in, and pnpm refuses to operate on a tree whose recorded store differs from the
+ * configured one (`ERR_PNPM_UNEXPECTED_STORE`), which breaks every later plugin operation.
+ * Both path facts are therefore rewritten to where this profile is installed — the same
+ * values pnpm itself writes when it installs there.
+ * @param profileDir - staging profile that received the tree.
+ * @param storeRoot - published pnpm store the links resolve against.
+ * @param installedProfileDir - path the staging profile takes once it is activated.
+ */
+function recordInstalledPnpmPaths(profileDir: string, storeRoot: string, installedProfileDir: string): void {
+  const modulesPath = join(profileDir, 'node_modules', '.modules.yaml')
+  if (!existsSync(modulesPath)) return
+  const storeVersion = readdirSync(storeRoot, { withFileTypes: true })
+    .filter(entry => entry.isDirectory() && STORE_VERSION_PATTERN.test(entry.name))
+    .map(entry => entry.name)
+    .sort()[0]
+  if (storeVersion === undefined) {
+    throw new Error(`desktop seed: package store ${storeRoot} holds no version directory`)
+  }
+  const content = readFileSync(modulesPath, 'utf8')
+  const facts: readonly (readonly [RecordedPathKey, string])[] = [
+    ['storeDir', join(storeRoot, storeVersion)],
+    ['virtualStoreDir', join(installedProfileDir, 'node_modules', '.pnpm')],
+  ]
+  let rewritten = content
+  for (const [key, value] of facts) {
+    rewritten = rewriteRecordedPath(restoreRecordedComma(rewritten, key), key, value)
+  }
+  // A tree that records neither path has nothing to correct, and rewriting more of pnpm's own
+  // record than these two facts would be guesswork about a format this module does not own.
+  if (rewritten !== content) writeFileSync(modulesPath, rewritten)
+}
+
+/**
+ * Rebuild one installed profile tree from its link manifest and archived entries.
+ *
+ * Every link resolves against a file the published store already owns, so the store has to be
+ * in place first and is deliberately not copied: activation renames the tree and the store
+ * separately, which leaves each pair sharing the inode the extraction created.
+ * @param seedRoot - verified seed directory holding the manifest and entry archive.
+ * @param profileDir - staging profile that receives the tree.
+ * @param storeRoot - published pnpm store the links resolve against.
+ * @param installedProfileDir - path this staging profile takes once it is activated.
+ * @param onProgress - receives the rebuilt fraction so a caller can show real progress.
+ */
+export async function materializeLinkedProfile(
+  seedRoot: string,
+  profileDir: string,
+  storeRoot: string,
+  installedProfileDir: string,
+  onProgress?: (fraction: number) => void,
+): Promise<void> {
+  const manifest = readProfileLinkManifest(seedRoot)
+  onProgress?.(0)
+  extract({
+    chmod: true,
+    cwd: profileDir,
+    file: join(seedRoot, SEED_PROFILE_FILE_ARCHIVE),
+    noMtime: true,
+    preservePaths: false,
+    processUmask: 0,
+    strict: true,
+    sync: true,
+  })
+  // The archive carries every directory the install created, so these only cover a manifest
+  // link whose parent the archive omitted; creating them once beats one mkdir per link.
+  const parents = new Set<string>()
+  for (const profilePath of Object.keys(manifest.links)) {
+    const parent = posix.dirname(profilePath)
+    if (parent !== '.' && parent !== '/') parents.add(parent)
+  }
+  for (const parent of [...parents].sort((left, right) => left.localeCompare(right))) {
+    mkdirSync(join(profileDir, ...parent.split('/')), { recursive: true, mode: 0o755 })
+  }
+  // Links are created concurrently: the work is one syscall per entry, so overlapping them
+  // costs nothing and hides the per-entry latency Windows charges for each new name. The
+  // archived entries land first and are a small share of this step on a cold machine, so the
+  // links own the rest of the bar.
+  const entries = Object.entries(manifest.links)
+  let linked = 0
+  let copied = 0
+  for (let start = 0; start < entries.length; start += COOPERATIVE_BATCH_ENTRIES) {
+    await Promise.all(entries.slice(start, start + COOPERATIVE_BATCH_ENTRIES).map(async ([profilePath, storePath]) => {
+      const source = join(storeRoot, ...storePath.split('/'))
+      const destination = join(profileDir, ...profilePath.split('/'))
+      try {
+        await link(source, destination)
+        return
+      } catch (error) {
+        // A link this filesystem refuses is not a reason to fail the launch. The store content
+        // is the same bytes either way, so the entry is copied instead — which costs space and
+        // time for that file but leaves a profile identical to the one linking would have built.
+        // Windows reports the refusal as `UNKNOWN` rather than a code that names the cause, and
+        // the same source links successfully in another directory, so the condition is treated
+        // as per-entry rather than per-store. ENOENT is only worth naming when the store itself
+        // lacks the content: then copying fails too, and the message says which entry is missing.
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          copied += 1
+          await copyFile(source, destination)
+          return
+        }
+        throw new Error(`desktop seed: profile link ${profilePath} targets a missing store file ${storePath}`)
+      }
+    }))
+    linked += COOPERATIVE_BATCH_ENTRIES
+    onProgress?.(0.2 + 0.8 * Math.min(linked / entries.length, 1))
+    await yieldToEventLoop()
+  }
+  if (copied > 0) {
+    console.log(`desktop seed: copied ${String(copied)} profile file(s) the filesystem would not link`)
+  }
+  onProgress?.(1)
+  recordInstalledPnpmPaths(profileDir, storeRoot, installedProfileDir)
+}

@@ -1,0 +1,87 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: Canvas;
+  color: CanvasText;
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  height: 100vh;
+  box-sizing: border-box;
+  padding: 24px 28px;
+  text-align: center;
+}
+
+#clip {
+  width: 100%;
+  max-width: 360px;
+  max-height: 40vh;
+  border-radius: 10px;
+  background: transparent;
+  object-fit: contain;
+}
+
+h1 {
+  margin: 0;
+  font-size: 26px;
+  letter-spacing: 0.02em;
+}
+
+#subtitle {
+  margin: 0;
+  color: GrayText;
+}
+
+#track {
+  width: 100%;
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, CanvasText 14%, transparent);
+}
+
+#bar {
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #4f7cf7, #7c5cf7);
+  transform: scaleX(0);
+  transform-origin: left center;
+}
+
+#elapsed {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+  color: GrayText;
+  font-size: 13px;
+}
+
+/* The line naming what the launch is doing right now. It sits between the bar and the elapsed
+   counter, and reserves its height so the layout does not jump when it appears. */
+#note {
+  min-height: 1.4em;
+  margin: 6px 0 0;
+  font-size: 0.85rem;
+  color: GrayText;
+  text-align: center;
+}
+
+/* The step the launch is in and how far into it, directly under the overall bar. It is the figure
+   that moves during a first launch's long steps, so it is set in the body colour and tabular
+   figures keep the percentage from shifting the text as the digits change. */
+#step {
+  min-height: 1.4em;
+  margin: 10px 0 0;
+  font-size: 0.95rem;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}

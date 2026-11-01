@@ -1,0 +1,967 @@
+import { createHash } from 'node:crypto'
+import { closeSync, cpSync, existsSync, mkdtempSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join, relative, sep } from 'node:path'
+import { pathToFileURL } from 'node:url'
+import { afterEach, describe, expect, it } from 'vitest'
+import { bundledPluginNames, bundledPluginPackageNames } from '../src/bundled-plugins.ts'
+import { resolveDesktopPaths } from '../src/paths.ts'
+import {
+  createSeedMetadata,
+  describeDesktopRecovery,
+  DesktopProjectManager,
+  packageNameFromSpec,
+  verifySeedIntegrity,
+  type DesktopProjectHooks,
+} from '../src/project-manager.ts'
+import { DESKTOP_HOST_PROTOCOL_VERSION } from '../src/host-protocol.ts'
+import { DESKTOP_HOST_PACKAGE, DESKTOP_PACKAGES_DIR, DESKTOP_PACKAGE_SET_FILE } from '../src/core-package-set.ts'
+import type { DesktopRelease } from '../src/release.ts'
+import {
+  archivePnpmStore,
+  SEED_PROFILE_FILE_ARCHIVE,
+  SEED_PROFILE_LINK_MANIFEST,
+} from '../src/seed-store.ts'
+import { create } from 'tar'
+
+const roots: string[] = []
+const releaseWorkers: Array<() => Promise<void>> = []
+
+function temporaryRoot(): string {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-desktop-test-'))
+  roots.push(root)
+  return root
+}
+
+function writeIntegrity(seed: string): void {
+  const paths: string[] = []
+  const visit = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name)
+      if (entry.isDirectory()) visit(path)
+      else if (entry.name !== 'integrity.json') paths.push(path)
+    }
+  }
+  visit(seed)
+  const files = paths.sort().map((path) => {
+    const body = readFileSync(path)
+    return {
+      path: relative(seed, path).split(sep).join('/'),
+      bytes: statSync(path).size,
+      sha256: createHash('sha256').update(body).digest('hex'),
+    }
+  })
+  writeFileSync(join(seed, 'integrity.json'), `${JSON.stringify({ schemaVersion: 2, files })}\n`)
+}
+
+function archiveStore(seed: string): void {
+  const store = join(seed, 'store')
+  mkdirSync(store, { recursive: true })
+  if (readdirSync(store).length === 0) writeFileSync(join(store, 'test-entry'), 'content')
+  archivePnpmStore(seed, store)
+}
+
+/**
+ * Seed store content plus the link manifest that rebuilds the profile tree from it.
+ *
+ * A real seed records the installed tree this way instead of shipping it (see
+ * `archiveLinkedProfile`), so a fixture that wants `applyRelease` to produce an installed
+ * profile has to supply the same pair: store files under `v11/files` and the links naming
+ * where each one lands in `node_modules`.
+ * @param seed - seed directory under construction.
+ * @param desktopRelease - release whose version the packaged core packages report.
+ */
+function writeLinkedProfileSeed(seed: string, desktopRelease: DesktopRelease): void {
+  const files = join(seed, 'store', 'v11', 'files')
+  mkdirSync(files, { recursive: true })
+  const record = (name: string, body: string): string => {
+    writeFileSync(join(files, name), body)
+    return `v11/files/${name}`
+  }
+  const links: Record<string, string> = {
+    'node_modules/@deepseek-ai/dsh/package.json': record(
+      'dsh-package.json',
+      `${JSON.stringify({ name: '@deepseek-ai/dsh', version: desktopRelease.version })}\n`,
+    ),
+    [`node_modules/${DESKTOP_HOST_PACKAGE}/package.json`]: record(
+      'host-package.json',
+      `${JSON.stringify({ name: DESKTOP_HOST_PACKAGE, version: desktopRelease.version })}\n`,
+    ),
+    [`node_modules/${DESKTOP_HOST_PACKAGE}/lib/index.js`]: record('host-lib-index.js', ''),
+  }
+  const template = join(seed, 'profile-template')
+  mkdirSync(join(template, 'node_modules'), { recursive: true })
+  // The shape a seed-side install leaves: the build-time store and the temporary directory
+  // pnpm installed in. Materialization has to correct both before pnpm will use the tree.
+  writeFileSync(join(template, 'node_modules', '.modules.yaml'), [
+    '"layoutVersion": 5,',
+    '"nodeLinker": "hoisted",',
+    '"storeDir": "C:\\\\Temp\\\\seed-build\\\\store\\\\v11",',
+    '"virtualStoreDir": "C:\\\\Temp\\\\seed-build\\\\node_modules\\\\.pnpm",',
+    '',
+  ].join('\n'))
+  create({
+    cwd: template,
+    file: join(seed, SEED_PROFILE_FILE_ARCHIVE),
+    noDirRecurse: true,
+    noMtime: true,
+    portable: true,
+    sync: true,
+  }, ['node_modules/.modules.yaml'])
+  rmSync(template, { recursive: true, force: true })
+  writeFileSync(
+    join(seed, SEED_PROFILE_LINK_MANIFEST),
+    `${JSON.stringify({ schemaVersion: 1, links }, undefined, 2)}\n`,
+  )
+}
+
+function writeCorePackageSet(seed: string, version: string): void {
+  const packages = [
+    { name: '@deepseek-ai/dsh', file: `deepseek-ai-dsh-${version}.tgz`, body: Buffer.from(`dsh-${version}`) },
+    {
+      name: '@deepseek-ai/dsh-desktop-host',
+      file: `deepseek-ai-dsh-desktop-host-${version}.tgz`,
+      body: Buffer.from(`desktop-host-${version}`),
+    },
+  ]
+  mkdirSync(join(seed, DESKTOP_PACKAGES_DIR), { recursive: true })
+  for (const entry of packages) writeFileSync(join(seed, DESKTOP_PACKAGES_DIR, entry.file), entry.body)
+  writeFileSync(join(seed, DESKTOP_PACKAGE_SET_FILE), `${JSON.stringify({
+    schemaVersion: 1,
+    packages: packages.map(({ name, file, body }) => ({
+      name,
+      version,
+      file,
+      bytes: body.byteLength,
+      integrity: `sha512-${createHash('sha512').update(body).digest('base64')}`,
+    })),
+  })}\n`)
+}
+
+function createTestSeedMetadata(seed: string, desktopRelease: DesktopRelease): void {
+  writeCorePackageSet(seed, desktopRelease.version)
+  createSeedMetadata(seed, desktopRelease)
+  // These specs cover the core install, the user-plugin mutations, and rollback. A seed
+  // that already carries the bundled plugin set would make every profile start with those
+  // plugins installed and activated, so the fixture strips the bundled plugins out of both
+  // lists to keep the original transaction semantics under test.
+  const manifestPath = join(seed, 'package.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
+    dependencies: Record<string, string>
+    dsh: { profile: { bundles: string[] } }
+  }
+  const installed = new Set(bundledPluginPackageNames())
+  const activated = new Set(bundledPluginNames())
+  // Rebuilt rather than deleted key by key: the fixture drops every bundled entry, and
+  // rebuilding keeps the object's shape stable instead of walking it into dictionary mode.
+  manifest.dependencies = Object.fromEntries(
+    Object.entries(manifest.dependencies).filter(([name]) => !installed.has(name)),
+  )
+  manifest.dsh.profile.bundles = manifest.dsh.profile.bundles.filter(bundle => !activated.has(bundle))
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, undefined, 2)}\n`)
+}
+
+function writeFakePnpm(root: string): string {
+  const path = join(root, 'pnpm.mjs')
+  writeFileSync(path, String.raw`
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+const args = process.argv.slice(2)
+const project = process.cwd()
+const command = args.find(value => value === 'install' || value === 'add' || value === 'remove')
+const manifestPath = join(project, 'package.json')
+const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+const packageName = spec => spec.startsWith('@')
+  ? spec.slice(0, spec.indexOf('@', spec.indexOf('/') + 1) === -1 ? undefined : spec.indexOf('@', spec.indexOf('/') + 1))
+  : spec.split('@')[0]
+const packageVersion = spec => {
+  const index = spec.startsWith('@') ? spec.indexOf('@', spec.indexOf('/') + 1) : spec.indexOf('@')
+  return index === -1 ? '1.0.0' : spec.slice(index + 1)
+}
+
+if (command === 'add') {
+  const spec = args[args.indexOf('add') + 1]
+  manifest.dependencies[packageName(spec)] = packageVersion(spec)
+}
+if (command === 'remove') delete manifest.dependencies[args[args.indexOf('remove') + 1]]
+writeFileSync(manifestPath, JSON.stringify(manifest))
+rmSync(join(project, 'node_modules'), { recursive: true, force: true })
+for (const [name, version] of Object.entries(manifest.dependencies)) {
+  const packageRoot = join(project, 'node_modules', ...name.split('/'))
+  mkdirSync(packageRoot, { recursive: true })
+  const core = name === '@deepseek-ai/dsh' || name === '@deepseek-ai/dsh-desktop-host'
+  const plugin = !core
+  const installedVersion = plugin
+    ? version
+    : JSON.parse(readFileSync(join(project, 'desktop-release.json'), 'utf8')).version
+  writeFileSync(join(packageRoot, 'package.json'), JSON.stringify({
+    name, version: installedVersion,
+    ...(plugin ? { dsh: { bundle: { patch: './bundle.yml' } } } : {}),
+  }))
+  if (plugin) writeFileSync(join(packageRoot, 'bundle.yml'), '[]\n')
+  else if (name === '@deepseek-ai/dsh-desktop-host') {
+    mkdirSync(join(packageRoot, 'lib'), { recursive: true })
+    writeFileSync(join(packageRoot, 'lib', 'index.js'), '')
+  }
+}
+writeFileSync(join(project, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
+if (process.env.TEST_PNPM_LOG) writeFileSync(process.env.TEST_PNPM_LOG, JSON.stringify({ args, env: process.env }))
+`)
+  return path
+}
+
+function writeBlockingFakePnpm(root: string, ready: string, release: string): string {
+  const path = join(root, 'blocking-pnpm.mjs')
+  const delegate = writeFakePnpm(root)
+  writeFileSync(path, `
+import { existsSync, writeFileSync } from 'node:fs'
+import { setTimeout as sleep } from 'node:timers/promises'
+writeFileSync(${JSON.stringify(ready)}, String(process.pid))
+while (!existsSync(${JSON.stringify(release)})) await sleep(10)
+await import(${JSON.stringify(pathToFileURL(delegate).href)})
+`)
+  return path
+}
+
+function hooks(overrides: Partial<DesktopProjectHooks> = {}): DesktopProjectHooks {
+  return {
+    healthCheck: async () => {},
+    beforeActivate: async () => {},
+    afterActivate: async () => {},
+    ...overrides,
+  }
+}
+
+function release(version = '1.0.0'): DesktopRelease {
+  return {
+    schemaVersion: 1,
+    version,
+    hostProtocolVersion: DESKTOP_HOST_PROTOCOL_VERSION,
+    nodeVersion: '24.17.0',
+    pnpmVersion: '11.7.0',
+  }
+}
+
+afterEach(async () => {
+  const cleanups = releaseWorkers.splice(0)
+  const directories = roots.splice(0)
+  const results = await Promise.allSettled(cleanups.map(cleanup => cleanup()))
+  for (const root of directories) rmSync(root, { recursive: true, force: true })
+  const failures: unknown[] = results.flatMap((result): unknown[] => result.status === 'rejected' ? [result.reason] : [])
+  if (failures.length > 0) throw new AggregateError(failures, 'desktop worker cleanup failed')
+})
+
+/** Registry-related environment as the machine had it, so a case can put it back. */
+interface RegistryEnvironment {
+  readonly lower: string | undefined
+  readonly upper: string | undefined
+}
+
+/**
+ * Take the registry variables out of the environment, remembering what they were.
+ *
+ * The suite runs on somebody's workstation, and a workstation may well have a mirror configured.
+ * Which registry an install uses is what these cases judge, so a case states the machine's silence
+ * rather than depending on the shell it happens to run in.
+ * @returns the values to restore.
+ */
+function clearRegistryEnvironment(): RegistryEnvironment {
+  const saved = { lower: process.env.npm_config_registry, upper: process.env.NPM_CONFIG_REGISTRY }
+  delete process.env.npm_config_registry
+  delete process.env.NPM_CONFIG_REGISTRY
+  return saved
+}
+
+/**
+ * Put the registry variables back the way the machine had them.
+ * @param saved - values from {@link clearRegistryEnvironment}.
+ */
+function restoreRegistryEnvironment(saved: RegistryEnvironment): void {
+  if (saved.lower === undefined) delete process.env.npm_config_registry
+  else process.env.npm_config_registry = saved.lower
+  if (saved.upper === undefined) delete process.env.NPM_CONFIG_REGISTRY
+  else process.env.NPM_CONFIG_REGISTRY = saved.upper
+}
+
+describe('desktop package policy', () => {
+  it('accepts registry package specs but rejects alternate sources and flags', () => {
+    expect(packageNameFromSpec('@scope/plugin@1.2.3')).toBe('@scope/plugin')
+    expect(packageNameFromSpec('plugin@next')).toBe('plugin')
+    expect(() => packageNameFromSpec('file:../plugin')).toThrow(/unsupported npm package spec/u)
+    expect(() => packageNameFromSpec('--registry=evil')).toThrow(/unsupported npm package spec/u)
+    expect(() => packageNameFromSpec('https://example.test/plugin.tgz')).toThrow(/unsupported npm package spec/u)
+  })
+
+  it('rejects any seed content changed after release inventory generation', async () => {
+    const seed = join(temporaryRoot(), 'seed')
+    createTestSeedMetadata(seed, release())
+    writeFileSync(join(seed, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
+    writeIntegrity(seed)
+    await expect(verifySeedIntegrity(seed)).resolves.toBeUndefined()
+    writeFileSync(join(seed, 'package.json'), '{}\n')
+    await expect(verifySeedIntegrity(seed)).rejects.toThrow(/integrity verification failed/u)
+  })
+})
+
+describe('desktop project transactions', () => {
+  it('rebuilds a profile an interrupted first install left incomplete', async () => {
+    const root = temporaryRoot()
+    const seed = join(root, 'seed')
+    createTestSeedMetadata(seed, release())
+    writeFileSync(join(seed, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
+    writeLinkedProfileSeed(seed, release())
+    writeFileSync(join(seed, 'store', 'seed-entry'), 'content')
+    archiveStore(seed)
+    writeIntegrity(seed)
+    const paths = resolveDesktopPaths(join(root, '.dsh'))
+    // A first launch killed mid-install leaves a profile directory holding the copied
+    // metadata but neither the release manifest nor installed packages. The release check
+    // used to read `desktop-release.json` from exactly this tree and fail the whole launch
+    // with an unactionable ENOENT; the absent manifest has to read as "no usable profile"
+    // so the seed rebuilds it.
+    mkdirSync(paths.profile, { recursive: true })
+    for (const name of ['package.json', 'pnpm-workspace.yaml']) {
+      writeFileSync(join(paths.profile, name), readFileSync(join(seed, name)))
+    }
+    expect(existsSync(join(paths.profile, 'desktop-release.json'))).toBe(false)
+    const manager = new DesktopProjectManager(paths, { node: process.execPath, pnpm: writeFakePnpm(root) })
+    await expect(manager.applyRelease(seed, '1.0.0', hooks())).resolves.toBe(true)
+    expect(manager.dshVersion()).toBe('1.0.0')
+    expect(existsSync(join(paths.profile, 'desktop-release.json'))).toBe(true)
+  })
+
+  it('unpacks the store again and retries when the rebuild finds it incomplete', async () => {
+    const root = temporaryRoot()
+    const seed = join(root, 'seed')
+    createTestSeedMetadata(seed, release())
+    writeFileSync(join(seed, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
+    writeLinkedProfileSeed(seed, release())
+    archiveStore(seed)
+    writeIntegrity(seed)
+    const paths = resolveDesktopPaths(join(root, '.dsh'))
+
+    // A store that has been unpacked but is not yet whole is what a first launch can meet:
+    // the rebuild links out of it and fails on an entry the unpack has not written. Removing
+    // one content file reproduces exactly that, and the seed archive still holds the bytes the
+    // retry needs.
+    const storeFile = join(paths.pnpm.store, 'v11', 'files', 'dsh-package.json')
+    let failedOnce = false
+    const manager = new DesktopProjectManager(paths, { node: process.execPath, pnpm: writeFakePnpm(root) })
+    const outcome = await manager.applyRelease(seed, '1.0.0', hooks({
+      step: (label) => {
+        if (label !== '重建桌面运行时' || failedOnce) return
+        rmSync(storeFile, { force: true })
+        rmSync(join(paths.pnpm.root, 'store-seed.json'), { force: true })
+        failedOnce = true
+      },
+    }))
+
+    expect(failedOnce).toBe(true)
+    expect(outcome).toBe(true)
+    expect(manager.dshVersion()).toBe('1.0.0')
+  })
+
+  it('reuses an installed profile instead of verifying the seed it never reads', async () => {
+    const root = temporaryRoot()
+    const seed = join(root, 'seed')
+    createTestSeedMetadata(seed, release())
+    writeFileSync(join(seed, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
+    writeLinkedProfileSeed(seed, release())
+    archiveStore(seed)
+    writeIntegrity(seed)
+    const paths = resolveDesktopPaths(join(root, '.dsh'))
+    const manager = new DesktopProjectManager(paths, { node: process.execPath, pnpm: writeFakePnpm(root) })
+    await expect(manager.applyRelease(seed, '1.0.0', hooks())).resolves.toBe(true)
+    // A launch whose profile already holds this release consumes no seed content, so the seed
+    // inventory is not re-read for it. Hashing the store archives to reach that same answer
+    // would charge every launch for the cost of the first one.
+    writeFileSync(join(seed, 'package.json'), '{}\n')
+    await expect(verifySeedIntegrity(seed)).rejects.toThrow(/integrity verification failed/u)
+    await expect(manager.applyRelease(seed, '1.0.0', hooks())).resolves.toBe(false)
+  })
+
+  it('replaces an installed profile when the seed was rebuilt under the same version', async () => {
+    const root = temporaryRoot()
+    const seed = join(root, 'seed')
+    createTestSeedMetadata(seed, release())
+    writeFileSync(join(seed, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
+    writeLinkedProfileSeed(seed, release())
+    archiveStore(seed)
+    writeIntegrity(seed)
+    const paths = resolveDesktopPaths(join(root, '.dsh'))
+    const manager = new DesktopProjectManager(paths, { node: process.execPath, pnpm: writeFakePnpm(root) })
+    await expect(manager.applyRelease(seed, '1.0.0', hooks())).resolves.toBe(true)
+
+    // The same release version, rebuilt: the seed inventory changed, so the installed profile
+    // is not this build. Version equality alone would keep serving the previous build's Host,
+    // which is how a rebuilt installer of an unchanged version used to leave its own fixes
+    // uninstalled.
+    writeFileSync(join(seed, 'package.json'), `${readFileSync(join(seed, 'package.json'), 'utf8')}\n`)
+    writeIntegrity(seed)
+
+    await expect(manager.applyRelease(seed, '1.0.0', hooks())).resolves.toBe(true)
+    await expect(manager.applyRelease(seed, '1.0.0', hooks())).resolves.toBe(false)
+  })
+
+  it('reuses a package store that already carries the seed', async () => {
+    const root = temporaryRoot()
+    const seed = join(root, 'seed')
+    createTestSeedMetadata(seed, release())
+    writeFileSync(join(seed, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
+    writeLinkedProfileSeed(seed, release())
+    archiveStore(seed)
+    writeIntegrity(seed)
+    const paths = resolveDesktopPaths(join(root, '.dsh'))
+    const manager = new DesktopProjectManager(paths, { node: process.execPath, pnpm: writeFakePnpm(root) })
+    const first: string[] = []
+    await expect(manager.applyRelease(seed, '1.0.0', hooks({ note: message => first.push(message) })))
+      .resolves.toBe(true)
+    expect(first).toContain('unpacking the bundled package store')
+
+    // Losing the profile is the common case. The store is still this seed's, so the launch
+    // rebuilds the tree and never unpacks the archives again.
+    rmSync(paths.profile, { recursive: true, force: true })
+    const second: string[] = []
+    await expect(manager.applyRelease(seed, '1.0.0', hooks({ note: message => second.push(message) })))
+      .resolves.toBe(true)
+    expect(second).toContain('package store already carries this seed')
+    expect(second).not.toContain('unpacking the bundled package store')
+    expect(manager.dshVersion()).toBe('1.0.0')
+  })
+
+  it('reuses the store when a rebuild ships the same archives and differs only in application code', async () => {
+    const root = temporaryRoot()
+    const seed = join(root, 'seed')
+    createTestSeedMetadata(seed, release())
+    writeFileSync(join(seed, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
+    writeLinkedProfileSeed(seed, release())
+    archiveStore(seed)
+    writeIntegrity(seed)
+    const paths = resolveDesktopPaths(join(root, '.dsh'))
+    const manager = new DesktopProjectManager(paths, { node: process.execPath, pnpm: writeFakePnpm(root) })
+    await expect(manager.applyRelease(seed, '1.0.0', hooks())).resolves.toBe(true)
+
+    // A rebuilt installer of the same packages ships byte-identical archives: the profile has
+    // to be rebuilt because its inventory moved, but unpacking those archives again would only
+    // recreate entries the store already holds, and that unpack is the longest step of a
+    // refresh. Keying the store marker on the archives is what lets this launch skip it.
+    writeFileSync(join(seed, 'package.json'), `${readFileSync(join(seed, 'package.json'), 'utf8')}\n`)
+    writeIntegrity(seed)
+    const rebuilt: string[] = []
+    await expect(manager.applyRelease(seed, '1.0.0', hooks({ note: message => rebuilt.push(message) })))
+      .resolves.toBe(true)
+    expect(rebuilt).toContain('package store already carries this seed')
+    expect(rebuilt).not.toContain('unpacking the bundled package store')
+  })
+
+  it('names every step of a first install and reports each step its own progress', async () => {
+    const root = temporaryRoot()
+    const seed = join(root, 'seed')
+    createTestSeedMetadata(seed, release())
+    writeFileSync(join(seed, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
+    writeLinkedProfileSeed(seed, release())
+    archiveStore(seed)
+    writeIntegrity(seed)
+    const paths = resolveDesktopPaths(join(root, '.dsh'))
+    const manager = new DesktopProjectManager(paths, { node: process.execPath, pnpm: writeFakePnpm(root) })
+
+    const steps: { label: string; fraction: number }[] = []
+    await expect(manager.applyRelease(seed, '1.0.0', hooks({
+      step: (label, fraction) => { steps.push({ label, fraction }) },
+    }))).resolves.toBe(true)
+
+    // A first launch is minutes of work in four different steps, and the bar moves too little
+    // within one of them to say whether it is working. Each step therefore names itself and
+    // carries its own fraction, which is what the window shows while that step runs.
+    const labels = [...new Set(steps.map(entry => entry.label))]
+    expect(labels).toEqual(['校验离线包内容', '展开软件包仓库', '重建桌面运行时', '检查运行时完整性'])
+    for (const label of labels) {
+      const fractions = steps.filter(entry => entry.label === label).map(entry => entry.fraction)
+      expect([...fractions].sort((left, right) => left - right)).toEqual(fractions)
+      expect(fractions.at(-1)).toBe(1)
+      for (const fraction of fractions) {
+        expect(fraction).toBeGreaterThanOrEqual(0)
+        expect(fraction).toBeLessThanOrEqual(1)
+      }
+    }
+  })
+
+  it('rebuilds a profile left without its manifest instead of reading it as installed', async () => {
+    const root = temporaryRoot()
+    const seed = join(root, 'seed')
+    createTestSeedMetadata(seed, release())
+    writeFileSync(join(seed, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
+    writeLinkedProfileSeed(seed, release())
+    archiveStore(seed)
+    writeIntegrity(seed)
+    const paths = resolveDesktopPaths(join(root, '.dsh'))
+    const manager = new DesktopProjectManager(paths, { node: process.execPath, pnpm: writeFakePnpm(root) })
+    await expect(manager.applyRelease(seed, '1.0.0', hooks())).resolves.toBe(true)
+
+    // A removal that could not finish leaves the package tree without the profile's own
+    // files. That tree is not an installed project: reading its plugin list raised ENOENT and
+    // aborted the launch before it could rebuild, which is a startup failure a residue must
+    // never cause.
+    for (const entry of readdirSync(paths.profile)) {
+      if (entry !== 'node_modules') rmSync(join(paths.profile, entry), { recursive: true, force: true })
+    }
+    await expect(manager.applyRelease(seed, '1.0.0', hooks())).resolves.toBe(true)
+    expect(existsSync(join(paths.profile, 'package.json'))).toBe(true)
+    expect(existsSync(join(paths.rollback, 'node_modules'))).toBe(true)
+  })
+
+  it('installs the offline seed and reconciles a mismatched private Host', async () => {
+    const root = temporaryRoot()
+    const seed = join(root, 'seed')
+    createTestSeedMetadata(seed, release())
+    writeFileSync(join(seed, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
+    writeLinkedProfileSeed(seed, release())
+    writeFileSync(join(seed, 'store', 'seed-entry'), 'content')
+    archiveStore(seed)
+    writeIntegrity(seed)
+    const paths = resolveDesktopPaths(join(root, '.dsh'))
+    const manager = new DesktopProjectManager(paths, { node: process.execPath, pnpm: writeFakePnpm(root) })
+    await expect(manager.applyRelease(seed, '2.0.0', hooks())).rejects.toThrow(/does not match Electron/u)
+    await manager.applyRelease(seed, '1.0.0', hooks())
+    // An installed profile holds the store's own files as hard links, so a Host build that
+    // differs has to arrive as its own file: writing through the link would rewrite the store
+    // entry every profile shares.
+    const hostManifest = join(paths.profile, 'node_modules', '@deepseek-ai', 'dsh-desktop-host', 'package.json')
+    rmSync(hostManifest)
+    writeFileSync(hostManifest, '{"name":"@deepseek-ai/dsh-desktop-host","version":"0.9.0"}\n')
+    await expect(manager.applyRelease(seed, '1.0.0', hooks())).resolves.toBe(true)
+    expect(manager.dshVersion()).toBe('1.0.0')
+    expect(manager.releaseVersion()).toBe('1.0.0')
+    expect(paths.profile).toBe(join(root, '.dsh', 'profiles', 'desktop'))
+    expect(existsSync(join(paths.profile, 'node_modules', '@deepseek-ai', 'dsh'))).toBe(true)
+    const installedHost = JSON.parse(readFileSync(
+      join(paths.profile, 'node_modules', '@deepseek-ai', 'dsh-desktop-host', 'package.json'),
+      'utf8',
+    )) as { version: string }
+    expect(installedHost.version).toBe('1.0.0')
+    expect(existsSync(join(paths.profile, 'desktop-plugins.json'))).toBe(false)
+    expect(readFileSync(join(paths.pnpm.store, 'seed-entry'), 'utf8')).toBe('content')
+    // The rebuilt tree is the store's own files, not copies: pnpm would have written the same
+    // bytes here at several times the cost of one link.
+    const linked = statSync(join(paths.profile, 'node_modules', '@deepseek-ai', 'dsh', 'package.json'))
+    const original = statSync(join(paths.pnpm.store, 'v11', 'files', 'dsh-package.json'))
+    expect(linked.ino).toBe(original.ino)
+    expect(linked.nlink).toBeGreaterThan(1)
+  })
+
+  it('restores the active project when the replacement backend cannot start', async () => {
+    const root = temporaryRoot()
+    const seed = join(root, 'seed')
+    createTestSeedMetadata(seed, release())
+    writeFileSync(join(seed, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
+    writeLinkedProfileSeed(seed, release())
+    archiveStore(seed)
+    writeIntegrity(seed)
+    const paths = resolveDesktopPaths(join(root, '.dsh'))
+    const manager = new DesktopProjectManager(paths, { node: process.execPath, pnpm: writeFakePnpm(root) })
+    await manager.applyRelease(seed, '1.0.0', hooks())
+    let starts = 0
+    await expect(manager.mutate({ type: 'plugin-add', spec: '@scope/plugin@2.0.0' }, hooks({
+      afterActivate: async () => {
+        starts += 1
+        if (starts === 1) throw new Error('backend rejected staged graph')
+      },
+    }))).rejects.toThrow(/backend rejected staged graph/u)
+    expect(manager.listPlugins()).toEqual([])
+    expect(manager.dshVersion()).toBe('1.0.0')
+    expect(starts).toBe(2)
+  })
+
+  it('refuses every mutation aimed at a plugin the release ships', async () => {
+    const root = temporaryRoot()
+    const seed = join(root, 'seed')
+    createTestSeedMetadata(seed, release())
+    writeFileSync(join(seed, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
+    writeLinkedProfileSeed(seed, release())
+    archiveStore(seed)
+    writeIntegrity(seed)
+    const paths = resolveDesktopPaths(join(root, '.dsh'))
+    const manager = new DesktopProjectManager(paths, { node: process.execPath, pnpm: writeFakePnpm(root) })
+    await manager.applyRelease(seed, '1.0.0', hooks())
+
+    // Both the activated set and the installed-but-inactive companions are pinned by the
+    // release, and `plugin-add` is the third route to the same version change: pnpm resolves
+    // the spec it is handed, so leaving it open would enforce nothing.
+    for (const name of bundledPluginPackageNames()) {
+      await expect(manager.mutate({ type: 'plugin-add', spec: `${name}@9.9.9` }, hooks()))
+        .rejects.toThrow(/bundled with Harness-CN/u)
+      await expect(manager.mutate({ type: 'plugin-remove', name }, hooks()))
+        .rejects.toThrow(/bundled with Harness-CN/u)
+      await expect(manager.mutate({ type: 'plugin-update', name, version: '9.9.9' }, hooks()))
+        .rejects.toThrow(/bundled with Harness-CN/u)
+    }
+    // Every refusal lands before the staging profile is written, so nothing changed.
+    expect(manager.listPlugins()).toEqual([])
+  })
+
+  it('restores rollback when the active move completed before its journal update', async () => {
+    const root = temporaryRoot()
+    const seed = join(root, 'seed')
+    createTestSeedMetadata(seed, release())
+    writeFileSync(join(seed, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
+    writeLinkedProfileSeed(seed, release())
+    archiveStore(seed)
+    writeIntegrity(seed)
+    const paths = resolveDesktopPaths(join(root, '.dsh'))
+    const manager = new DesktopProjectManager(paths, { node: process.execPath, pnpm: writeFakePnpm(root) })
+    await manager.applyRelease(seed, '1.0.0', hooks())
+    await manager.mutate({ type: 'plugin-add', spec: '@scope/plugin@2.0.0' }, hooks())
+    const stagingProfile = join(paths.staging, 'interrupted', 'profile')
+    mkdirSync(stagingProfile, { recursive: true })
+    writeFileSync(join(stagingProfile, 'marker'), 'staging')
+    rmSync(paths.rollback, { recursive: true, force: true })
+    mkdirSync(dirname(paths.rollback), { recursive: true })
+    renameSync(paths.profile, paths.rollback)
+    writeFileSync(paths.pending, `${JSON.stringify({
+      schemaVersion: 1,
+      id: 'interrupted',
+      stagingProfile,
+      step: 'prepared',
+    })}\n`)
+
+    manager.recover()
+
+    expect(manager.listPlugins()).toEqual([{ name: '@scope/plugin', version: '2.0.0', bundled: false }])
+    expect(existsSync(stagingProfile)).toBe(false)
+    expect(existsSync(paths.pending)).toBe(false)
+  })
+
+  it('reports the runtime an interrupted activation put back', async () => {
+    const root = temporaryRoot()
+    const seed = join(root, 'seed')
+    createTestSeedMetadata(seed, release())
+    writeFileSync(join(seed, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
+    writeLinkedProfileSeed(seed, release())
+    archiveStore(seed)
+    writeIntegrity(seed)
+    const paths = resolveDesktopPaths(join(root, '.dsh'))
+    const manager = new DesktopProjectManager(paths, { node: process.execPath, pnpm: writeFakePnpm(root) })
+    await manager.applyRelease(seed, '1.0.0', hooks())
+    const stagingProfile = join(paths.staging, 'interrupted', 'profile')
+    mkdirSync(stagingProfile, { recursive: true })
+    rmSync(paths.rollback, { recursive: true, force: true })
+    mkdirSync(dirname(paths.rollback), { recursive: true })
+    renameSync(paths.profile, paths.rollback)
+    writeFileSync(paths.pending, `${JSON.stringify({
+      schemaVersion: 1,
+      id: 'interrupted',
+      stagingProfile,
+      step: 'prepared',
+    })}\n`)
+
+    const report = manager.recover()
+
+    // The shell prints these lines, so they are the whole record of a repair that would
+    // otherwise be invisible: recovery runs before anything reads the profile and says nothing.
+    if (report === undefined) throw new Error('expected the interrupted activation to be reported')
+    expect(describeDesktopRecovery(report)).toEqual([
+      'activation recovery: the previous launch stopped at prepared',
+      `activation recovery: restored ${paths.rollback} as the active profile`,
+      "activation recovery: discarded the interrupted launch's staging tree",
+    ])
+  })
+
+  it('discards a superseded runtime copy when the replacement already committed', async () => {
+    const root = temporaryRoot()
+    const seed = join(root, 'seed')
+    createTestSeedMetadata(seed, release())
+    writeFileSync(join(seed, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
+    writeLinkedProfileSeed(seed, release())
+    archiveStore(seed)
+    writeIntegrity(seed)
+    const paths = resolveDesktopPaths(join(root, '.dsh'))
+    const manager = new DesktopProjectManager(paths, { node: process.execPath, pnpm: writeFakePnpm(root) })
+    await manager.applyRelease(seed, '1.0.0', hooks())
+    const stagingProfile = join(paths.staging, 'interrupted', 'profile')
+    mkdirSync(stagingProfile, { recursive: true })
+    rmSync(paths.rollback, { recursive: true, force: true })
+    cpSync(paths.profile, paths.rollback, { recursive: true })
+    writeFileSync(paths.pending, `${JSON.stringify({
+      schemaVersion: 1,
+      id: 'interrupted',
+      stagingProfile,
+      step: 'staging-activated',
+    })}\n`)
+
+    const report = manager.recover()
+
+    // Both trees exist because the replacement booted and the launch stopped before the journal
+    // was cleared: the runtime beside the profile is the one it replaced, and the profile it
+    // was replaced by is the one to keep.
+    expect(report).toEqual({
+      step: 'staging-activated',
+      rollback: paths.rollback,
+      restored: false,
+      discardedRollback: true,
+      discardedStaging: true,
+    })
+    expect(manager.dshVersion()).toBe('1.0.0')
+    expect(existsSync(paths.rollback)).toBe(false)
+    expect(existsSync(paths.pending)).toBe(false)
+  })
+
+  it('keeps the active profile when the replacement cannot move it aside', async () => {
+    const root = temporaryRoot()
+    const seed = join(root, 'seed')
+    createTestSeedMetadata(seed, release())
+    writeFileSync(join(seed, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
+    writeLinkedProfileSeed(seed, release())
+    archiveStore(seed)
+    writeIntegrity(seed)
+    const paths = resolveDesktopPaths(join(root, '.dsh'))
+    const manager = new DesktopProjectManager(paths, { node: process.execPath, pnpm: writeFakePnpm(root) })
+    await manager.applyRelease(seed, '1.0.0', hooks())
+    // A path the moved-aside copy cannot occupy stands in for every failure that lands before
+    // the profile moves. The cleanup must then leave the profile alone: it is still the runtime
+    // the user has, and removing it is what turned one failure into a lost installation.
+    rmSync(paths.rollback, { recursive: true, force: true })
+    mkdirSync(dirname(paths.rollback), { recursive: true })
+    writeFileSync(paths.rollback, 'occupied')
+
+    await expect(manager.mutate({ type: 'plugin-add', spec: '@scope/plugin@2.0.0' }, hooks()))
+      .rejects.toThrow(/owned directory path is not a directory/u)
+
+    expect(existsSync(paths.profile)).toBe(true)
+    expect(manager.dshVersion()).toBe('1.0.0')
+    expect(manager.listPlugins()).toEqual([])
+    // Nothing moved, so the journal names no repair a later launch would have to make.
+    expect(existsSync(paths.pending)).toBe(false)
+  })
+
+  it.skipIf(process.platform !== 'win32')('names the runtime an open handle keeps in place', async () => {
+    const root = temporaryRoot()
+    const seed = join(root, 'seed')
+    createTestSeedMetadata(seed, release())
+    writeFileSync(join(seed, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
+    writeLinkedProfileSeed(seed, release())
+    archiveStore(seed)
+    writeIntegrity(seed)
+    const paths = resolveDesktopPaths(join(root, '.dsh'))
+    const manager = new DesktopProjectManager(paths, { node: process.execPath, pnpm: writeFakePnpm(root) })
+    await manager.applyRelease(seed, '1.0.0', hooks())
+    // Windows refuses to rename a directory while any process holds a handle inside it, which
+    // is the state a second launch — or another program reading the same home — leaves behind.
+    const held = openSync(join(paths.profile, 'package.json'), 'r')
+    try {
+      await expect(manager.mutate({ type: 'plugin-add', spec: '@scope/plugin@2.0.0' }, hooks()))
+        .rejects.toThrow(/is in use and could not be moved/u)
+    } finally {
+      closeSync(held)
+    }
+
+    expect(existsSync(paths.profile)).toBe(true)
+    expect(manager.dshVersion()).toBe('1.0.0')
+  })
+
+  it('records the live pnpm worker as transaction owner until it exits', async ({ task, signal }) => {
+    const root = temporaryRoot()
+    const seed = join(root, 'seed')
+    const ready = join(root, 'pnpm-ready')
+    const releaseWorker = join(root, 'pnpm-release')
+    createTestSeedMetadata(seed, release())
+    writeFileSync(join(seed, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
+    writeLinkedProfileSeed(seed, release())
+    archiveStore(seed)
+    writeIntegrity(seed)
+    const paths = resolveDesktopPaths(join(root, '.dsh'))
+    const runtime = { node: process.execPath, pnpm: writeBlockingFakePnpm(root, ready, releaseWorker) }
+    const manager = new DesktopProjectManager(paths, runtime)
+    await manager.applyRelease(seed, '1.0.0', hooks())
+    // Only a dependency mutation spawns pnpm now; activation rebuilds the tree from the seed's
+    // links. The lock still has to name whichever child is running, so drive it from a mutation.
+    const installing = manager.mutate({ type: 'plugin-add', spec: '@scope/plugin@2.0.0' }, hooks())
+    // Teardown observes failures even if the runner has abandoned the test body.
+    const completed = installing.then(value => ({ value }), (error: unknown) => ({ error }))
+    releaseWorkers.push(async () => {
+      writeFileSync(releaseWorker, 'continue')
+      const outcome = await completed
+      if ('error' in outcome) throw outcome.error
+    })
+    // Child startup shares the test budget; an aborted poll must not resume ownership assertions.
+    await expect.poll(() => {
+      signal.throwIfAborted()
+      return existsSync(ready)
+    }, { timeout: task.timeout }).toBe(true)
+    signal.throwIfAborted()
+    const workerPid = Number.parseInt(readFileSync(ready, 'utf8'), 10)
+    expect(readFileSync(paths.lock, 'utf8')).toBe(`${String(workerPid)}\n`)
+    const competing = new DesktopProjectManager(paths, runtime)
+    await expect(competing.applyRelease(seed, '1.0.0', hooks())).rejects.toThrow(/another package transaction is active/u)
+    writeFileSync(releaseWorker, 'continue')
+    await expect(installing).resolves.toBeUndefined()
+    expect(existsSync(paths.lock)).toBe(false)
+  })
+
+  it('keeps core packages local while installing plugins from the desktop registry', async () => {
+    const root = temporaryRoot()
+    const seed = join(root, 'seed')
+    const log = join(root, 'pnpm-log.json')
+    createTestSeedMetadata(seed, release())
+    writeFileSync(join(seed, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
+    writeLinkedProfileSeed(seed, release())
+    archiveStore(seed)
+    writeIntegrity(seed)
+    const paths = resolveDesktopPaths(join(root, '.dsh'))
+    const manager = new DesktopProjectManager(paths, { node: process.execPath, pnpm: writeFakePnpm(root) })
+    await manager.applyRelease(seed, '1.0.0', hooks())
+    const previousLog = process.env.TEST_PNPM_LOG
+    process.env.TEST_PNPM_LOG = log
+    const registryEnvironment = clearRegistryEnvironment()
+    try {
+      await manager.mutate({ type: 'plugin-add', spec: '@scope/plugin@2.0.0' }, hooks())
+    } finally {
+      restoreRegistryEnvironment(registryEnvironment)
+      if (previousLog === undefined) delete process.env.TEST_PNPM_LOG
+      else process.env.TEST_PNPM_LOG = previousLog
+    }
+
+    const manifest = JSON.parse(readFileSync(join(paths.profile, 'package.json'), 'utf8')) as {
+      dependencies: Record<string, string>
+    }
+    const coreSpec = manifest.dependencies['@deepseek-ai/dsh']
+    expect(coreSpec).toMatch(/^file:\.\/desktop-packages\//u)
+    expect(readFileSync(join(paths.profile, 'pnpm-workspace.yaml'), 'utf8'))
+      .toContain(`${JSON.stringify('@deepseek-ai/dsh')}: ${JSON.stringify(coreSpec)}`)
+    expect(manifest.dependencies['@scope/plugin']).toBe('2.0.0')
+    const invocation = JSON.parse(readFileSync(log, 'utf8')) as { args: string[]; env: Record<string, string> }
+    expect(invocation.args).toContain('add')
+    expect(invocation.args).toContain('@scope/plugin@2.0.0')
+    expect(invocation.args).toContain('--config.registry=https://registry.npmmirror.com/')
+    expect(invocation.args).toContain(`--config.store-dir=${paths.pnpm.store}`)
+    expect(invocation.args).toContain('--config.enable-global-virtual-store=false')
+    expect(invocation.env.NPM_CONFIG_REGISTRY).toBe('https://registry.npmmirror.com/')
+    expect(invocation.env.NPM_CONFIG_STORE_DIR).toBe(paths.pnpm.store)
+    expect(invocation.env.NPM_CONFIG_USERCONFIG).toBe(join(paths.pnpm.config, 'npmrc'))
+    expect(invocation.env.npm_config_registry).toBeUndefined()
+  })
+
+  it('installs from the registry the machine names instead of this product’s default', async () => {
+    const root = temporaryRoot()
+    const seed = join(root, 'seed')
+    const log = join(root, 'pnpm-log.json')
+    createTestSeedMetadata(seed, release())
+    writeFileSync(join(seed, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
+    writeLinkedProfileSeed(seed, release())
+    archiveStore(seed)
+    writeIntegrity(seed)
+    const paths = resolveDesktopPaths(join(root, '.dsh'))
+    const manager = new DesktopProjectManager(paths, { node: process.execPath, pnpm: writeFakePnpm(root) })
+    await manager.applyRelease(seed, '1.0.0', hooks())
+    const previousLog = process.env.TEST_PNPM_LOG
+    process.env.TEST_PNPM_LOG = log
+    const registryEnvironment = clearRegistryEnvironment()
+    // A mirror is only usable when pnpm is allowed to reach it: naming a registry on the command
+    // line would override the file that named it, which is the bug this case exists to prevent.
+    process.env.NPM_CONFIG_REGISTRY = 'https://registry.npmjs.org'
+    try {
+      await manager.mutate({ type: 'plugin-add', spec: '@scope/plugin@2.0.0' }, hooks())
+    } finally {
+      restoreRegistryEnvironment(registryEnvironment)
+      if (previousLog === undefined) delete process.env.TEST_PNPM_LOG
+      else process.env.TEST_PNPM_LOG = previousLog
+    }
+
+    const invocation = JSON.parse(readFileSync(log, 'utf8')) as { args: string[]; env: Record<string, string> }
+    expect(invocation.args.some(argument => argument.startsWith('--config.registry='))).toBe(false)
+    expect(invocation.env.NPM_CONFIG_REGISTRY).toBe('https://registry.npmjs.org/')
+  })
+
+  it('reconciles dsh to the packaged release without removing desktop plugins', async () => {
+    const root = temporaryRoot()
+    const paths = resolveDesktopPaths(join(root, '.dsh'))
+    const manager = new DesktopProjectManager(paths, { node: process.execPath, pnpm: writeFakePnpm(root) })
+    const firstSeed = join(root, 'seed-1')
+    createTestSeedMetadata(firstSeed, release('1.0.0'))
+    writeFileSync(join(firstSeed, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
+    mkdirSync(join(firstSeed, 'store'), { recursive: true })
+    writeFileSync(join(firstSeed, 'store', 'release-1'), 'one')
+    writeLinkedProfileSeed(firstSeed, release('1.0.0'))
+    archiveStore(firstSeed)
+    writeIntegrity(firstSeed)
+    await manager.applyRelease(firstSeed, '1.0.0', hooks())
+    await manager.mutate({ type: 'plugin-add', spec: '@scope/plugin@2.0.0' }, hooks())
+
+    const nextSeed = join(root, 'seed-2')
+    createTestSeedMetadata(nextSeed, release('1.1.0'))
+    writeFileSync(join(nextSeed, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
+    mkdirSync(join(nextSeed, 'store'), { recursive: true })
+    writeFileSync(join(nextSeed, 'store', 'release-2'), 'two')
+    writeLinkedProfileSeed(nextSeed, release('1.1.0'))
+    archiveStore(nextSeed)
+    writeIntegrity(nextSeed)
+
+    await expect(manager.applyRelease(nextSeed, '1.1.0', hooks())).resolves.toBe(true)
+    expect(manager.releaseVersion()).toBe('1.1.0')
+    expect(manager.dshVersion()).toBe('1.1.0')
+    expect(manager.listPlugins()).toEqual([{ name: '@scope/plugin', version: '2.0.0', bundled: false }])
+    const profile = JSON.parse(readFileSync(join(paths.profile, 'package.json'), 'utf8')) as {
+      dsh: { profile: { bundles: string[] } }
+    }
+    expect(profile.dsh.profile.bundles).toEqual([
+      '@deepseek-ai/dsh-base',
+      '@deepseek-ai/dsh-web-app',
+      '@scope/plugin',
+    ])
+    expect(readFileSync(join(paths.pnpm.store, 'release-1'), 'utf8')).toBe('one')
+    expect(readFileSync(join(paths.pnpm.store, 'release-2'), 'utf8')).toBe('two')
+    await expect(manager.applyRelease(nextSeed, '1.1.0', hooks())).resolves.toBe(false)
+  })
+
+  it('keeps a bundled plugin at the version this release ships instead of the older pin it replaced', async () => {
+    const root = temporaryRoot()
+    const paths = resolveDesktopPaths(join(root, '.dsh'))
+    const log = join(root, 'pnpm-log.json')
+    const manager = new DesktopProjectManager(paths, { node: process.execPath, pnpm: writeFakePnpm(root) })
+    const firstSeed = join(root, 'seed-1')
+    createTestSeedMetadata(firstSeed, release('1.0.0'))
+    writeFileSync(join(firstSeed, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
+    mkdirSync(join(firstSeed, 'store'), { recursive: true })
+    writeFileSync(join(firstSeed, 'store', 'release-1'), 'one')
+    writeLinkedProfileSeed(firstSeed, release('1.0.0'))
+    archiveStore(firstSeed)
+    writeIntegrity(firstSeed)
+    await manager.applyRelease(firstSeed, '1.0.0', hooks())
+    await manager.mutate({ type: 'plugin-add', spec: '@scope/plugin@2.0.0' }, hooks())
+
+    // A profile an older release wrote records that release's pin for a plugin this one bundles,
+    // next to a plugin the user added themselves. Only the user's plugin may be restored.
+    const manifestPath = join(paths.profile, 'package.json')
+    const name = 'dsh-wechat'
+    const stale = JSON.parse(readFileSync(manifestPath, 'utf8')) as { dependencies: Record<string, string> }
+    stale.dependencies[name] = '0.8.0'
+    writeFileSync(manifestPath, `${JSON.stringify(stale, undefined, 2)}\n`)
+
+    const nextSeed = join(root, 'seed-2')
+    createTestSeedMetadata(nextSeed, release('1.1.0'))
+    writeFileSync(join(nextSeed, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
+    mkdirSync(join(nextSeed, 'store'), { recursive: true })
+    writeFileSync(join(nextSeed, 'store', 'release-2'), 'two')
+    writeLinkedProfileSeed(nextSeed, release('1.1.0'))
+    archiveStore(nextSeed)
+    writeIntegrity(nextSeed)
+    const previousLog = process.env.TEST_PNPM_LOG
+    process.env.TEST_PNPM_LOG = log
+    try {
+      await expect(manager.applyRelease(nextSeed, '1.1.0', hooks())).resolves.toBe(true)
+    } finally {
+      if (previousLog === undefined) delete process.env.TEST_PNPM_LOG
+      else process.env.TEST_PNPM_LOG = previousLog
+    }
+
+    const rebuilt = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
+      dependencies: Record<string, string>
+      dsh: { profile: { bundles: string[] } }
+    }
+    expect(rebuilt.dsh.profile.bundles).toContain('@scope/plugin')
+    expect(existsSync(log)).toBe(true)
+    const invocation = JSON.parse(readFileSync(log, 'utf8')) as { args: string[] }
+    expect(invocation.args).toContain('@scope/plugin@2.0.0')
+    expect(invocation.args).not.toContain(`${name}@0.8.0`)
+    expect(invocation.args.join(' ')).not.toContain(name)
+  })
+})

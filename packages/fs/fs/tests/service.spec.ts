@@ -1,0 +1,305 @@
+/**
+ * Tests for the filesystem Service Definition: registration, duplicate-service
+ * behavior, disposal, the path-changing operations, and the branded id
+ * factories. The provider primitives and
+ * policy live in `dsh-fs-local` and `dsh-fs-observation-policy`; this seam owns only the
+ * abstract service contract, so a minimal fake backend exercises it.
+ */
+
+import { describe, expect, it } from 'vitest'
+import { Context } from '@deepseek-ai/cordis'
+import { FileSystem, FsError, FsTargetKey, FsVersion } from '@deepseek-ai/dsh-fs'
+import type {
+  FsCopyOutcome,
+  FsCreateDirectoryOptions,
+  FsCreateOutcome,
+  FsDirEntry,
+  FsEditOutcome,
+  FsByteWriteOutcome,
+  FsEditRequest,
+  FsInfo,
+  FsMoveOutcome,
+  FsPathInfo,
+  FsRemoveOptions,
+  FsRemoveOutcome,
+  FsTarget,
+  FsWriteIntent,
+  FsWriteOutcome,
+} from '@deepseek-ai/dsh-fs'
+
+/** A minimal in-memory fake implementing the provider primitives. */
+class FakeFileSystem extends FileSystem {
+  files = new Map<string, string>()
+  /** Directories this fake creates, so the create/remove contract has something to report a version for. */
+  directories = new Map<string, FsVersion>()
+  /** Byte writes keep their own storage so a non-UTF-8 payload is not forced through text. */
+  byteFiles = new Map<string, Uint8Array>()
+
+  override async resolve(path: string): Promise<FsTarget> {
+    return { targetKey: FsTargetKey(path), displayPath: path }
+  }
+  override processPath(target: FsTarget): string { return String(target.targetKey) }
+  override fileUrl(target: FsTarget): string { return `file:///${encodeURIComponent(String(target.targetKey))}` }
+  override contains(parent: FsTarget, child: FsTarget): boolean {
+    return child.targetKey === parent.targetKey || String(child.targetKey).startsWith(`${parent.targetKey}/`)
+  }
+  override async stat(target: FsTarget): Promise<FsInfo | undefined> {
+    const content = this.files.get(target.targetKey)
+    if (content === undefined) return undefined
+    return { version: FsVersion('v1'), type: 'file', size: content.length }
+  }
+  override async lstat(path: string): Promise<FsPathInfo | undefined> {
+    const content = this.files.get(path)
+    if (content === undefined) return undefined
+    return { version: FsVersion('v1'), type: 'file', size: content.length }
+  }
+  override async readText(target: FsTarget): Promise<string> {
+    const content = this.files.get(target.targetKey)
+    if (content === undefined) throw new FsError(`not found: ${target.displayPath}`, 'FS_NOT_FOUND')
+    return content
+  }
+  override async streamText(target: FsTarget): Promise<AsyncIterable<string>> {
+    const content = await this.readText(target)
+    return (async function* () { yield content })()
+  }
+  override async readBytes(target: FsTarget, _signal: AbortSignal | undefined, maxBytes: number): Promise<Uint8Array> {
+    const bytes = new TextEncoder().encode(await this.readText(target))
+    if (bytes.length > maxBytes) {
+      throw new FsError(`too large: ${target.displayPath}`, 'FS_TOO_LARGE')
+    }
+    return bytes
+  }
+  override async readByteRange(target: FsTarget, range: { offset: number; length: number }): Promise<Uint8Array> {
+    return new TextEncoder().encode(await this.readText(target)).subarray(range.offset, range.offset + range.length)
+  }
+  override async listDir(target: FsTarget): Promise<FsDirEntry[]> {
+    if (target.targetKey !== 'skills') throw new FsError(`not a directory: ${target.displayPath}`, 'FS_NOT_DIRECTORY')
+    return [
+      {
+        name: 'alpha.md',
+        type: 'file',
+        target: { targetKey: FsTargetKey('skills/alpha.md'), displayPath: 'skills/alpha.md' },
+        size: 2,
+        version: FsVersion('v1'),
+      },
+    ]
+  }
+  override async writeText(target: FsTarget, content: string, _expected?: FsWriteIntent): Promise<FsWriteOutcome> {
+    const before = this.files.get(target.targetKey) ?? null
+    this.files.set(target.targetKey, content)
+    return { operation: before !== null ? 'update' : 'create', version: FsVersion('v2'), before, after: content }
+  }
+  override async writeBytes(target: FsTarget, content: Uint8Array, _expected?: FsWriteIntent): Promise<FsByteWriteOutcome> {
+    const existed = this.files.has(target.targetKey)
+    this.byteFiles.set(target.targetKey, content)
+    return { operation: existed ? 'update' : 'create', version: FsVersion('v2'), bytes: content.byteLength }
+  }
+  override async editText(target: FsTarget, edit: FsEditRequest): Promise<FsEditOutcome> {
+    const content = this.files.get(target.targetKey) ?? ''
+    const after = content.split(edit.oldString).join(edit.newString)
+    this.files.set(target.targetKey, after)
+    return { version: FsVersion('v3'), before: content, after }
+  }
+
+  override async createDirectory(
+    target: FsTarget,
+    options?: FsCreateDirectoryOptions,
+  ): Promise<FsCreateOutcome> {
+    const existing = this.directories.get(target.targetKey)
+    if (existing !== undefined) {
+      if (options?.recursive === true) return { target, version: existing, type: 'directory' }
+      throw new FsError(`already exists: ${target.displayPath}`, 'FS_ALREADY_EXISTS')
+    }
+    this.directories.set(target.targetKey, FsVersion('d1'))
+    return { target, version: FsVersion('d1'), type: 'directory' }
+  }
+
+  override async createFile(target: FsTarget): Promise<FsCreateOutcome> {
+    if (this.files.has(target.targetKey) || this.directories.has(target.targetKey)) {
+      throw new FsError(`already exists: ${target.displayPath}`, 'FS_ALREADY_EXISTS')
+    }
+    this.files.set(target.targetKey, '')
+    return { target, version: FsVersion('v1'), type: 'file' }
+  }
+
+  override async remove(target: FsTarget, options?: FsRemoveOptions): Promise<FsRemoveOutcome> {
+    if (this.files.delete(target.targetKey)) return { type: 'file' }
+    const children = [...this.files.keys(), ...this.directories.keys()]
+      .filter(key => key.startsWith(`${target.targetKey}/`))
+    if (children.length > 0 && options?.recursive !== true) {
+      throw new FsError(`not empty: ${target.displayPath}`, 'FS_NOT_EMPTY')
+    }
+    for (const key of children) {
+      this.files.delete(key)
+      this.directories.delete(key)
+    }
+    if (!this.directories.delete(target.targetKey)) {
+      throw new FsError(`not found: ${target.displayPath}`, 'FS_NOT_FOUND')
+    }
+    return { type: 'directory' }
+  }
+
+  override async copy(from: FsTarget, to: FsTarget): Promise<FsCopyOutcome> {
+    const content = this.files.get(from.targetKey)
+    if (content === undefined) {
+      throw new FsError(`not found: ${from.displayPath}`, 'FS_NOT_FOUND')
+    }
+    this.files.set(to.targetKey, content)
+    return { target: to, type: 'file' }
+  }
+
+  override async move(from: FsTarget, to: FsTarget): Promise<FsMoveOutcome> {
+    const content = this.files.get(from.targetKey)
+    if (content === undefined) {
+      throw new FsError(`not found: ${from.displayPath}`, 'FS_NOT_FOUND')
+    }
+    this.files.delete(from.targetKey)
+    this.files.set(to.targetKey, content)
+    return { target: to, type: 'file' }
+  }
+}
+
+describe('FileSystem provider seam', () => {
+  it('registers as ctx.fs and serves the primitives', async () => {
+    const ctx = new Context()
+    await ctx.plugin(FakeFileSystem)
+    const fs = ctx.fs as FakeFileSystem
+    expect(fs.sandboxMode).toBeUndefined()
+    expect(fs.processPathFromHostPath('/host/file')).toBeUndefined()
+    fs.files.set('a.txt', 'hi')
+    const target = await fs.resolve('a.txt')
+    expect((await fs.stat(target))?.type).toBe('file')
+    expect(await fs.readText(target)).toBe('hi')
+  })
+
+  it('throws when a second implementation is loaded (duplicate service)', async () => {
+    const ctx = new Context()
+    await ctx.plugin(FakeFileSystem)
+    await expect(ctx.plugin(FakeFileSystem)).rejects.toThrow()
+  })
+
+  it('removes the service when the providing fiber is disposed', async () => {
+    const ctx = new Context()
+    const fiber = await ctx.plugin(FakeFileSystem)
+    expect(ctx.fs).toBeDefined()
+    await fiber.dispose()
+    expect(ctx.fs).toBeUndefined()
+  })
+
+  it('streamText yields the same text readText returns', async () => {
+    const ctx = new Context()
+    await ctx.plugin(FakeFileSystem)
+    const fs = ctx.fs as FakeFileSystem
+    fs.files.set('a.txt', 'one\ntwo')
+    const target = await fs.resolve('a.txt')
+    let streamed = ''
+    for await (const chunk of await fs.streamText(target)) streamed += chunk
+    expect(streamed).toBe(await fs.readText(target))
+  })
+
+  it('readByteRange returns the window, shorter at the end and empty past it', async () => {
+    const ctx = new Context()
+    await ctx.plugin(FakeFileSystem)
+    const fs = ctx.fs as FakeFileSystem
+    fs.files.set('a.bin', 'hello')
+    const target = await fs.resolve('a.bin')
+    expect(await fs.readByteRange(target, { offset: 1, length: 3 })).toEqual(new TextEncoder().encode('ell'))
+    expect(await fs.readByteRange(target, { offset: 3, length: 10 })).toEqual(new TextEncoder().encode('lo'))
+    expect(await fs.readByteRange(target, { offset: 9, length: 2 })).toHaveLength(0)
+  })
+
+  it('readBytes returns raw content and enforces the byte cap with FS_TOO_LARGE', async () => {
+    const ctx = new Context()
+    await ctx.plugin(FakeFileSystem)
+    const fs = ctx.fs as FakeFileSystem
+    fs.files.set('a.bin', 'hi')
+    const target = await fs.resolve('a.bin')
+    expect(await fs.readBytes(target, undefined, 2)).toEqual(new TextEncoder().encode('hi'))
+    await expect(fs.readBytes(target, undefined, 1)).rejects.toMatchObject({ code: 'FS_TOO_LARGE' })
+  })
+
+  it('listDir returns child entry targets without reading file content', async () => {
+    const ctx = new Context()
+    await ctx.plugin(FakeFileSystem)
+    const fs = ctx.fs as FakeFileSystem
+    const entries = await fs.listDir(await fs.resolve('skills'))
+    expect(entries).toEqual([{
+      name: 'alpha.md',
+      type: 'file',
+      target: { targetKey: 'skills/alpha.md', displayPath: 'skills/alpha.md' },
+      size: 2,
+      version: 'v1',
+    }])
+  })
+
+  it('stat returns undefined for an absent target', async () => {
+    const ctx = new Context()
+    await ctx.plugin(FakeFileSystem)
+    const fs = ctx.fs as FakeFileSystem
+    expect(await fs.stat(await fs.resolve('missing.txt'))).toBeUndefined()
+  })
+
+  it('lstat returns path metadata before resolving a target', async () => {
+    const ctx = new Context()
+    await ctx.plugin(FakeFileSystem)
+    const fs = ctx.fs as FakeFileSystem
+    fs.files.set('a.txt', 'hi')
+    expect(await fs.lstat('a.txt')).toEqual({ version: 'v1', type: 'file', size: 2 })
+    expect(await fs.lstat('missing.txt')).toBeUndefined()
+  })
+
+  it('serves the path-changing operations through the abstract seam', async () => {
+    const ctx = new Context()
+    await ctx.plugin(FakeFileSystem)
+    const fs = ctx.fs as FakeFileSystem
+
+    const created = await fs.createDirectory(await fs.resolve('skills'))
+    expect(created).toMatchObject({ version: 'd1', type: 'directory' })
+    expect((await fs.createDirectory(created.target, { recursive: true })).version).toBe('d1')
+    await expect(fs.createDirectory(created.target)).rejects.toMatchObject({ code: 'FS_ALREADY_EXISTS' })
+
+    const file = await fs.createFile(await fs.resolve('skills/a.txt'))
+    expect(file.type).toBe('file')
+    await expect(fs.createFile(file.target)).rejects.toMatchObject({ code: 'FS_ALREADY_EXISTS' })
+
+    const copied = await fs.copy(file.target, await fs.resolve('skills/b.txt'))
+    expect(await fs.readText(copied.target)).toBe('')
+    const moved = await fs.move(copied.target, await fs.resolve('skills/c.txt'))
+    expect(await fs.stat(file.target)).toBeDefined()
+    expect(await fs.remove(moved.target)).toEqual({ type: 'file' })
+
+    await expect(fs.remove(created.target)).rejects.toMatchObject({ code: 'FS_NOT_EMPTY' })
+  })
+
+  it('rejects a path-changing operation on a target the fake does not hold', async () => {
+    const ctx = new Context()
+    await ctx.plugin(FakeFileSystem)
+    const fs = ctx.fs as FakeFileSystem
+    const missing = await fs.resolve('missing.txt')
+    await expect(fs.copy(missing, await fs.resolve('other.txt'))).rejects.toMatchObject({ code: 'FS_NOT_FOUND' })
+    await expect(fs.move(missing, await fs.resolve('other.txt'))).rejects.toMatchObject({ code: 'FS_NOT_FOUND' })
+  })
+})
+
+describe('branded id factories', () => {
+  it('FsTargetKey and FsVersion brand a string at compile time (identity at runtime)', () => {
+    expect(FsTargetKey('k')).toBe('k')
+    expect(FsVersion('v')).toBe('v')
+  })
+})
+
+describe('FsError', () => {
+  it('carries a stable code and HarnessError name', () => {
+    const error = new FsError('nope', 'FS_NOT_FOUND')
+    expect(error.code).toBe('FS_NOT_FOUND')
+    expect(error.name).toBe('FsError')
+    expect(error).toBeInstanceOf(Error)
+  })
+
+  it('chains an underlying cause through ErrorOptions', () => {
+    const root = new Error('EACCES')
+    const error = new FsError('cannot read', 'FS_ABORTED', { cause: root })
+    expect(error.cause).toBe(root)
+    expect(error.code).toBe('FS_ABORTED')
+  })
+})
