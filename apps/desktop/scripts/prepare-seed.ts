@@ -82,6 +82,12 @@ function runPnpm(args: readonly string[]): Promise<void> {
       '--config.registry=https://registry.npmmirror.com/',
       `--config.store-dir=${STORE_ROOT}`,
       '--config.enable-global-virtual-store=false',
+      // The store already holds almost every tarball a release needs; without this a flaky
+      // mirror turns a rebuild into 40 minutes of retries (error 23) and then a timeout.
+      // Never pass --config.fetch-timeout here: pnpm reads that value as seconds, so a large
+      // number turns one slow request into an hours-long wait that looks exactly like a deadlock
+      // (no CPU, no sockets, no error, no lockfile).
+      '--config.prefer-offline=true',
       `--config.userconfig=${userConfig}`,
       command,
       ...commandArgs,
