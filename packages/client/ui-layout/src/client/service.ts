@@ -13,6 +13,9 @@ import type { Branded } from '@deepseek-ai/dsh-brand'
 import type { createLayoutStore } from './stores.ts'
 
 /** Identity shared by a sidebar panel entry and its main-slot occupant. */
+/** The three ways the frame can present its columns. */
+export type PresentationStage = 'conversation' | 'workstation' | 'ide'
+
 export type MainPanelId = Branded<'MainPanelId'>
 
 /** Root-scoped navigation state exposed to panel-aware components. */
@@ -30,9 +33,10 @@ export type PanelActions = BoundActions<ReturnType<typeof createLayoutStore>>
  * in a spec — still constructs a controller; every other transition it exposes
  * is required.
  */
-export type LayoutPanelActions = Omit<PanelActions, 'setWorkstation' | 'setWorkstationWidth'> & {
+export type LayoutPanelActions = Omit<PanelActions, 'setWorkstation' | 'setWorkstationWidth' | 'setIde'> & {
   setWorkstation?: (on: boolean) => void
   setWorkstationWidth?: (px: number) => void
+  setIde?: (on: boolean) => void
 }
 
 /** The presentation source a controller reports when its host has none. */
@@ -85,6 +89,24 @@ export interface ILayout {
   /** Toggle the workstation layout. */
   toggleWorkstation(): void
   /**
+   * Whether the frame is in the full-screen IDE stage: the seat keeps its tree
+   * and editor while the centre column steps aside.
+   */
+  readonly ide: HostObservable<boolean>
+  /**
+   * Advance the frame one stage: the conversation layout, then the workstation
+   * layout, then the IDE stage, and back to the conversation.
+   */
+  cyclePresentation(): void
+  /**
+   * Put the frame into one named stage whatever it is showing now.
+   *
+   * Optional: it is a convenience over the setters, and a controller assembled by
+   * an older caller still satisfies this face.
+   * @param stage - the stage to show.
+   */
+  setStage?(stage: PresentationStage): void
+  /**
    * Saved workstation seat width in px, or null while the ratio default applies.
    *
    * Optional like the seat's writer, so a controller built before the seat became
@@ -117,6 +139,7 @@ export class LayoutController implements ILayout {
     readonly panelInfo: HostObservable<PanelInfo>,
     readonly workstation: HostObservable<boolean> = HIDDEN_WORKSTATION,
     readonly workstationWidth: HostObservable<number | null> = UNSAVED_WORKSTATION_WIDTH,
+    readonly ide: HostObservable<boolean> = HIDDEN_WORKSTATION,
   ) {}
 
   /** Select a global panel or return to the Conversation. */
@@ -163,6 +186,39 @@ export class LayoutController implements ILayout {
   /** Toggle the workstation layout against its current presentation. */
   toggleWorkstation(): void {
     this.panels.setWorkstation?.(!this.workstation.getSnapshot())
+  }
+
+  /**
+   * Advance one stage: conversation → workstation → IDE → conversation.
+   *
+   * The IDE stage is entered from the workstation layout and left by closing
+   * that layout, so the sequence never jumps from the conversation straight
+   * into a seat the user has not seen yet.
+   */
+  cyclePresentation(): void {
+    if (!this.workstation.getSnapshot()) {
+      this.panels.setWorkstation?.(true)
+      return
+    }
+    if (this.ide.getSnapshot()) {
+      this.panels.setWorkstation?.(false)
+      return
+    }
+    this.panels.setIde?.(true)
+  }
+
+  /**
+   * Show one named stage.
+   *
+   * The seat layout is opened first because the IDE stage lives inside it: the
+   * store refuses the full-screen flag while the seat is off, so asking for both
+   * in the other order would silently land on the conversation layout.
+   * @param stage - the stage to show.
+   */
+  setStage(stage: PresentationStage): void {
+    const seat = stage !== 'conversation'
+    if (this.workstation.getSnapshot() !== seat) this.panels.setWorkstation?.(seat)
+    this.panels.setIde?.(stage === 'ide')
   }
 
   /** Save the workstation seat's drag width. */

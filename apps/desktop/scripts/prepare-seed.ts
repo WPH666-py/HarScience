@@ -84,8 +84,10 @@ function runPnpm(args: readonly string[]): Promise<void> {
     // "Expected `concurrency` to be a number from 1 and up, got `4` (string)".
     writeFileSync(userConfig, [
       // The mirror aborts (error 23) when a dozen large tarballs are requested at once.
-      'network-concurrency=4',
-      'fetch-retries=6',
+      // The mirror aborts (error 23) on a burst of the largest tarballs, and a single aborted
+      // request fails the whole seed, so two at a time trades a few minutes for a green build.
+      'network-concurrency=2',
+      'fetch-retries=10',
       '',
     ].join('\n'))
     const child = spawn(NODE, [
@@ -209,6 +211,21 @@ function patchInstalledRemoteSshWorkspaceTree(root: string): Promise<void> {
     child.once('close', (code, signal) => {
       if (code === 0) resolvePromise()
       else reject(new Error(`desktop seed: remote-ssh workspace tree patch exited with ${String(code ?? signal)}`))
+    })
+  })
+}
+
+function patchInstalledRemoteSshSearch(root: string): Promise<void> {
+  // The plugin can list a directory on a remote host but cannot answer which files on it match a
+  // name; the workstation tree's search box needs that answered where the filesystem is. Patching the
+  // installed Host source here puts the route in the archived store, and every profile materialized
+  // from this seed carries it. See scripts/patch-remote-ssh-search.mjs.
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(NODE, [join(APP_ROOT, 'scripts', 'patch-remote-ssh-search.mjs'), root], { stdio: 'inherit' })
+    child.once('error', reject)
+    child.once('close', (code, signal) => {
+      if (code === 0) resolvePromise()
+      else reject(new Error(`desktop seed: remote-ssh search patch exited with ${String(code ?? signal)}`))
     })
   })
 }
@@ -544,6 +561,7 @@ async function main(): Promise<void> {
     // patch: that one edits the source and the generated bundle by text, and would be overwritten
     // by a later regeneration.
     await patchInstalledRemoteSshWorkspaceTree(installedModules)
+    await patchInstalledRemoteSshSearch(installedModules)
     await patchInstalledRemoteSshEmptyState(installedModules)
     await patchInstalledRemoteSshDataLock(installedModules)
     await patchInstalledQqbotConsole(installedModules)
