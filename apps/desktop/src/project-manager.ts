@@ -91,6 +91,16 @@ interface DesktopStoreSeedRecord {
  */
 const PROFILE_COMPATIBILITY_FILE = 'compatibility.json'
 
+/**
+ * The profile's own patch layer, `dsh-app-boot`'s `PROFILE_PATCH_FILENAME`.
+ *
+ * The seed ships it holding the preview-notice acknowledgement, because a client reads that
+ * acknowledgement out of the profile's settings and a fresh profile would otherwise open the notice
+ * on its first launch. Every later settings write appends to this same file, so the transaction has
+ * to carry the user's copy forward instead of recreating the seeded one.
+ */
+const PROFILE_PATCH_FILE = 'cordis.patch.yml'
+
 /** Files the package transaction copies between active and staging projects. */
 const DESKTOP_PROJECT_FILES = [
   'package.json',
@@ -100,6 +110,7 @@ const DESKTOP_PROJECT_FILES = [
   DESKTOP_SEED_IDENTITY_FILE,
   DESKTOP_PACKAGE_SET_FILE,
   PROFILE_COMPATIBILITY_FILE,
+  PROFILE_PATCH_FILE,
 ] as const
 
 /** Manifest that marks a directory as a desktop project; the move-aside takes it with the tree. */
@@ -219,6 +230,16 @@ const DESKTOP_PROFILE_BUNDLES = ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-
 
 /** The plugins this release ships, whose versions and presence the release owns. */
 const BUNDLED_PLUGIN_NAMES = new Set(bundledPluginPackageNames())
+
+/**
+ * Versions pinned because the transitive range resolves to a version that cannot be installed.
+ *
+ * `@openmaic/generation@0.3.29` asks for `@openmaic/dsl@^0.13.0`, which was never published (0.12.0
+ * is the newest release), so a fresh seed install fails with `ERR_PNPM_NO_MATCHING_VERSION` even
+ * though the plugin itself is fine. The pin holds the version this release was tested with; drop it
+ * once upstream publishes 0.13 or republishes generation against 0.12.
+ */
+const TRANSITIVE_PINS: Readonly<Record<string, string>> = { '@openmaic/generation': '0.3.28' }
 
 /**
  * Refuse a mutation aimed at a plugin this release ships.
@@ -1544,7 +1565,7 @@ export function createSeedMetadata(seedDir: string, release: DesktopRelease): vo
   writeJson(join(seedDir, 'package.json'), manifest)
   writeFileSync(
     join(seedDir, 'pnpm-workspace.yaml'),
-    workspaceFile(desktopCorePackageOverrides(packageSet)),
+    workspaceFile({ ...desktopCorePackageOverrides(packageSet), ...TRANSITIVE_PINS }),
     { mode: 0o600 },
   )
   writeJson(join(seedDir, 'desktop-release.json'), release)
