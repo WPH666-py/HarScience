@@ -24,7 +24,8 @@ import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { workstationFace } from './face.ts'
 import type { WorkstationInject } from './face.ts'
 import { en, zh } from './locales.ts'
-import { REMOTE_FILES, startRemoteHosts } from './remote.ts'
+import { HOST_USED_EVENT, REMOTE_FILES, leaveRemoteHost, startRemoteHosts } from './remote.ts'
+import { ServerExitButton, type ServerExitInjected } from './ServerExitButton.tsx'
 import { createWorkstationStore } from './store.ts'
 import { Workstation } from './Workstation.tsx'
 import { WorkstationToggle, type WorkstationToggleInjected } from './WorkstationToggle.tsx'
@@ -88,14 +89,29 @@ export function apply(ctx: ClientContext): void {
   // the seat's 回到对话 pill is the way back. Only a *change* of host moves the
   // frame, so someone who returns to the conversation is not dragged out again by
   // a host that merely stays current.
+  // A server page is the seat layout, not the full-screen one: the header it carries is the
+  // only place the way out lives, and the full-screen stage collapses that header with the
+  // conversation.
   ctx.effect(() => {
     let previous = hosts.getSnapshot().currentHostId
+    ctx.layout.setServerMode(previous !== null)
     return hosts.subscribe(() => {
       const current = hosts.getSnapshot().currentHostId
-      if (current !== null && current !== previous) ctx.layout.setStage?.('ide')
+      ctx.layout.setServerMode(current !== null)
+      if (current !== null && current !== previous) ctx.layout.setStage?.('workstation')
       previous = current
     })
   }, 'ui-workstation: follow the current host')
+
+  // The host list in the remote panel activates a host through the same route as 「使用」, and
+  // announces it here: picking a server has to show that server's files even when it was
+  // already the current one, which the observable above deliberately ignores.
+  ctx.effect(() => {
+    if (typeof window === 'undefined') return () => {}
+    const open = (): void => { ctx.layout.setStage?.('workstation') }
+    window.addEventListener(HOST_USED_EVENT, open)
+    return () => { window.removeEventListener(HOST_USED_EVENT, open) }
+  }, 'ui-workstation: open the server page when a host is picked')
 
   const face = workstationFace({
     remote: ctx.remote,
@@ -131,4 +147,20 @@ export function apply(ctx: ClientContext): void {
     locale: NS,
     inject: (): WorkstationToggleInjected => ({ cyclePresentation: () => { ctx.layout.cyclePresentation() } }),
   }, WorkstationToggle)), 'ui-workstation: header toggle')
+
+  // The header's one server-page control. It shares the row with the toggle, and
+  // the two never show together: the stages are this desktop's, leaving is the
+  // server's.
+  ctx.effect(() => ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register({
+    name: 'conversation.session.header.utilities',
+    id: 'server-exit',
+    locale: NS,
+    inject: (): ServerExitInjected => ({
+      leaveServer: () => {
+        void leaveRemoteHost().then((failure) => {
+          if (failure !== null) console.error('ui-workstation: leaving the server failed:', failure.message)
+        })
+      },
+    }),
+  }, ServerExitButton)), 'ui-workstation: server exit')
 }
