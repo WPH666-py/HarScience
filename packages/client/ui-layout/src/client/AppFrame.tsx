@@ -332,7 +332,12 @@ export function AppFrame({
       <div className={css.workstationCol} data-shell-workstation>
         {workstationSeat}
       </div>
-      <div className={css.sidebarCol}>
+      <div
+        className={css.sidebarCol}
+        onClickCapture={() => {
+          if (narrow && !layoutInfo.narrowExpanded) actions.expandSidebar()
+        }}
+      >
         {sidebar}
       </div>
       <>

@@ -100,6 +100,7 @@ type LayoutActions = {
   toggleSidebar: (draft: LayoutState) => void
   /** Close the narrow panel after the tap that used it; a wide frame keeps its preference. */
   collapseSidebar: (draft: LayoutState) => void
+  expandSidebar: (draft: LayoutState) => void
   setViewportWidth: (draft: LayoutState, width: number) => void
   setRightbar: (draft: LayoutState, px: number) => void
   openRightbar: (draft: LayoutState, track: boolean, fullscreen: boolean) => void
@@ -165,6 +166,11 @@ export function createLayoutStore(): EngineStoreHandle<LayoutState, LayoutAction
       // tap that lands in one closes it and gives the frame back to the text.
       collapseSidebar: (d) => {
         d.layoutInfo.narrowExpanded = false
+      },
+      // The rail is the only door a narrow viewport has: a tap that lands on it is a
+      // request for the panel, so it opens instead of doing nothing.
+      expandSidebar: (d) => {
+        d.layoutInfo.narrowExpanded = true
       },
       // Crossing the breakpoint in either direction drops the override: the
       // narrow default is auto-collapsed, the wide state is the preference.
