@@ -151,9 +151,18 @@ function readSource(file) {
 export function patchRemoteSshSearch(nodeModules) {
   const api = join(nodeModules, API)
   if (!existsSync(api)) return []
-  if (readFileSync(api, 'utf8').includes(MARKER)) return []
-  const sources = new Map()
   const changed = []
+  // The route module is written even when the route table already carries the marker: a tree
+  // restored from a package store can hold a patched host-api.js beside a missing search.js, and
+  // returning early there leaves verifyRemoteSshSearch staring at exactly that hole.
+  const search = join(nodeModules, SEARCH)
+  const payload = readFileSync(PAYLOAD, 'utf8')
+  if (!existsSync(search) || readFileSync(search, 'utf8') !== payload) {
+    writeFileSync(search, payload, 'utf8')
+    changed.push(search)
+  }
+  if (readFileSync(api, 'utf8').includes(MARKER)) return changed
+  const sources = new Map()
   for (const edit of EDITS) {
     const file = join(nodeModules, edit.file)
     if (!sources.has(file)) sources.set(file, readSource(file))
@@ -167,12 +176,6 @@ export function patchRemoteSshSearch(nodeModules) {
   }
   for (const [file, source] of sources) {
     writeFileSync(file, source.crlf ? source.text.replaceAll('\n', '\r\n') : source.text, 'utf8')
-  }
-  const search = join(nodeModules, SEARCH)
-  const payload = readFileSync(PAYLOAD, 'utf8')
-  if (!existsSync(search) || readFileSync(search, 'utf8') !== payload) {
-    writeFileSync(search, payload, 'utf8')
-    changed.push(search)
   }
   return changed
 }
