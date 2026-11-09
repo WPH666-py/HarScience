@@ -23,8 +23,13 @@ function readWidthPreference(): number | null {
 /** Resolve the width displayed for one measured Conversation column. */
 function resolveContentWidth(columnWidth: number, preference: number | null): number {
   const max = Math.max(CONTENT_MIN, columnWidth - CONTENT_EDGE_BUDGET)
-  if (preference !== null) return Math.min(Math.max(preference, CONTENT_MIN), max)
-  return Math.max(680, Math.min(columnWidth * 0.64, 920))
+  const resolved = preference !== null
+    ? Math.min(Math.max(preference, CONTENT_MIN), max)
+    : Math.max(680, Math.min(columnWidth * 0.64, 920))
+  // The floor above is a desktop promise: it assumes a column wider than 680px. A phone
+  // column is narrower than that floor, and a transcript laid out past its own edge is
+  // clipped to the right of the viewport — the screen then reads as an empty column.
+  return columnWidth > 0 ? Math.min(resolved, columnWidth) : resolved
 }
 
 /** Convert a wheel event's vertical delta to scrollport pixels. */

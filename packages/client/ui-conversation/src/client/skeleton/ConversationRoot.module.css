@@ -429,6 +429,18 @@ button.crumb:hover {
   --dsh-composer-dock-inset: 8px;
 }
 
+/* A phone cannot afford the desktop floor: the shared axis clamps at 680px, which
+   is wider than the whole frame at 390px, so the transcript and the composer would
+   lay out past the right edge and read as a blank column. Below the phone breakpoint
+   the axis follows whatever the column actually is. */
+@media (max-width: 640px) {
+  .body {
+    --dsh-chat-content-width: min(calc(100% - 16px), 920px);
+    --dsh-composer-card-max-width: calc(100% - 8px);
+    --dsh-composer-side-clearance: 8px;
+  }
+}
+
 .embeddedBody {
   overflow: hidden;
   --dsh-chat-content-width: min(calc(100% - 32px), 920px);
