@@ -13,7 +13,7 @@
  * Its own stdout is a line protocol read by the Rust shell, so nothing else may write there.
  */
 
-import { existsSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 import { spawn } from 'node:child_process'
@@ -379,6 +379,40 @@ async function prebuild(argv: readonly string[]): Promise<void> {
   note(activated ? 'desktop runtime installed during setup' : 'desktop runtime already matches the release')
   await warmRuntime(options, paths, logs, note)
   await logs.close()
+}
+
+function isRecordOf(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
+/**
+ * Whether a previous launch's verdict still describes this seed and this installation.
+ *
+ * The rebuild check walks the whole profile tree and can only answer "already installed" until
+ * the release or the seed changes, so a launch that already got that answer records it with the
+ * seed's identity. Every input the verdict was derived from is compared again here; a mismatch
+ * sends the launch back through the check, which is the only path that installs or repairs.
+ * @param record - parsed contents of the verdict file.
+ * @param version - the release this shell runs.
+ * @param seedMtimeMs - modification time of the seed's integrity file.
+ * @param seedSize - size of the seed's integrity file.
+ * @param host - parsed manifest of the installed host package.
+ * @returns whether the recorded verdict matches every current input.
+ */
+function verdictMatches(
+  record: unknown,
+  version: string,
+  seedMtimeMs: number,
+  seedSize: number,
+  host: unknown,
+): boolean {
+  if (!isRecordOf(record)) return false
+  return record.schemaVersion === 1
+    && record.version === version
+    && record.seedMtimeMs === seedMtimeMs
+    && record.seedSize === seedSize
+    && isRecordOf(host)
+    && host.version === version
 }
 
 async function main(): Promise<void> {
@@ -792,7 +826,27 @@ async function main(): Promise<void> {
     logShell(`offline package: ${seed.origin} at ${seed.directory}`)
     publishStatus({ phase: 'starting', progress: 0.15, version: options.version })
     logShell('checking the desktop runtime against the bundled release')
-    const activated = await manager.applyRelease(seed.directory, options.version, {
+    const launchVerifiedPath = join(paths.root, 'launch-verified.json')
+    const seedIntegrityPath = join(seed.directory, 'integrity.json')
+    let verifiedHit = false
+    try {
+      const integrity = statSync(seedIntegrityPath)
+      verifiedHit = verdictMatches(
+        JSON.parse(readFileSync(launchVerifiedPath, 'utf8')),
+        options.version,
+        integrity.mtimeMs,
+        integrity.size,
+        JSON.parse(readFileSync(
+          join(paths.profile, 'node_modules', '@deepseek-ai', 'dsh-desktop-host', 'package.json'),
+          'utf8',
+        )),
+      )
+    } catch (error) {
+      // An absent or unreadable record only means the launch pays for the check again.
+      logShell(`launch record: ${errorOf(error, 'launch record').message}`)
+    }
+    if (verifiedHit) logShell('launch verified on a previous launch; skipping the rebuild check')
+    const activated = verifiedHit ? false : await manager.applyRelease(seed.directory, options.version, {
       ...hooks,
       // A tree built from a verified seed is checked for completeness rather than booted: the boot
       // would cost about fifty seconds of every first launch and every upgrade, and the only thing
@@ -814,27 +868,51 @@ async function main(): Promise<void> {
       beforeActivate: async () => {},
       afterActivate: async () => {},
     })
+    if (!verifiedHit) {
+      try {
+        const integrity = statSync(seedIntegrityPath)
+        writeFileSync(launchVerifiedPath, JSON.stringify({
+          schemaVersion: 1,
+          version: options.version,
+          seedMtimeMs: integrity.mtimeMs,
+          seedSize: integrity.size,
+          recordedAt: new Date().toISOString(),
+        }))
+      } catch (error) {
+        // A verdict that cannot be written only costs the next launch the check again.
+        logShell(`launch record: ${errorOf(error, 'launch record').message}`)
+      }
+    }
     logShell(activated
       ? 'desktop runtime installed from the bundled seed'
       : 'desktop runtime already matches the bundled release')
-    // The REA plugin cannot do anything until its bundle is provisioned, and that download runs to
-    // about 800 MiB, so it happens beside the workspace rather than in front of it. The setup script
-    // is idempotent and resumes from its cache, so a later launch picks up where this one stopped.
-    const reaState = provisionReaBundle({
-      node: options.node,
-      profile: paths.profile,
-      plugins: paths.plugins,
-      home,
-      log: logShell,
-    })
-    logShell(`REA bundle: ${reaState}`)
+    // The REA setup and the Python extras are downloads and interpreter probes that never gate the
+    // workspace: both are idempotent and resume from their own cache, and their child processes
+    // compete with the Host for the same cold files when they start first. They wait for ready.
+    const provisionAfterReady = (): void => {
+      const reaState = provisionReaBundle({
+        node: options.node,
+        profile: paths.profile,
+        plugins: paths.plugins,
+        home,
+        log: logShell,
+      })
+      logShell(`REA bundle: ${reaState}`)
+      if (PRODUCT_NAME !== SCIENCE_PRODUCT) return
+      // The science panels import `chemcore` and `rdkit` from the provisioned interpreter.
+      provisionPythonExtras({
+        home,
+        wheelhouse: join(options.resourceDir, 'science', 'wheelhouse'),
+        log: logShell,
+      })
+    }
     // The science product brings Python, MinGW, and R, and each is hundreds of megabytes: starting
     // them here keeps the download behind the workspace instead of in front of it, and the launch
     // only records the decision. The office product ships none of them, so it never reaches this.
     if (PRODUCT_NAME === SCIENCE_PRODUCT) {
       for (const state of provisionRuntimes({ home, log: logShell })) logShell(`runtimes: ${state}`)
       // Plugins spawn `python` / `python3` / `g++` by bare name, so the provisioned trees have to be
-      // on PATH before a panel opens. A first launch has nothing on disk yet, hence the poll.
+      // on PATH before the Host spawns. A first launch has nothing on disk yet, hence the poll.
       const adopt = (): number => {
         const added = adoptRuntimePath(home)
         if (added.length > 0) logShell(`runtimes: PATH += ${added.join('; ')}`)
@@ -846,13 +924,6 @@ async function main(): Promise<void> {
         }, 20_000)
         setTimeout(() => clearInterval(timer), 30 * 60_000).unref()
       }
-      // The science panels import `chemcore` and `rdkit` from that interpreter; both installs are
-      // idempotent and run beside the workspace.
-      provisionPythonExtras({
-        home,
-        wheelhouse: join(options.resourceDir, 'science', 'wheelhouse'),
-        log: logShell,
-      })
     }
     // Starting the Host is the one step with no denominator: dsh reports that it is ready, and
     // nothing in between counts anything, so this shows how long it has been running instead of a
@@ -893,6 +964,7 @@ async function main(): Promise<void> {
       logShell(`credential check failed; skipping the binding gate: ${errorOf(error, 'credential check failed').message}`)
     }
     handshake({ type: 'ready', port: running.port, shellPort: running.shellPort, needsApiKey: false })
+    setTimeout(provisionAfterReady, 0)
     }
 
     /**

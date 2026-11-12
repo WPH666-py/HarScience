@@ -7,10 +7,12 @@ export interface BundledPlugin {
   /**
    * Whether a fresh profile lists the plugin in `dsh.profile.bundles`.
    *
-   * Every bundled plugin is installed either way. Four kinds are installed but not listed:
+   * Every bundled plugin is installed either way. Five kinds are installed but not listed:
    * a companion a sibling's bundle patch pulls in itself, a plugin whose first run would block
    * startup on unrelated provisioning, a plugin whose rows the Desktop Host's own patch layer
-   * mounts, and a plugin whose browser half waits on a service only a later line provides. A
+   * mounts, a plugin whose browser half waits on a service only a later line provides, and a
+   * plugin whose declared peer range excludes this product's baseline — the loader skips its
+   * bundle at composition time, so listing it only adds a failing row to every launch. A
    * companion must stay out of the list because it declares no `dsh.bundle.patch`, which
    * `inspectPlugin` rejects — the same reason the Host-mounted rows cannot be listed, since
    * upstream mounts those from its own bundle compositions — and an absent service has to stay
@@ -93,7 +95,7 @@ const ALL_PLUGINS: readonly BundledPlugin[] = [
     version: '0.10.0',
     active: true,
   },
-  { name: '@jieai/dsh-plugin-vet', version: '0.3.12', active: true },
+  { name: '@jieai/dsh-plugin-vet', version: '0.3.12', active: false }, // peer range excludes this baseline
   { name: '@liustack/modlens', version: '3.26.1', active: true },
   {
     // Long-term project memory for coding agents, backed by a Hindsight server. Its bundle
@@ -122,11 +124,11 @@ const ALL_PLUGINS: readonly BundledPlugin[] = [
     // the profile already provides, at ranges 0.1.5-rc.8 satisfies.
     name: 'billion-context-dsh',
     version: '0.2.26',
-    active: true,
-  },
+    active: false,
+  }, // peer range excludes this baseline
   { name: 'dsh-chat-import', version: '0.17.1', active: true },
-  { name: 'dsh-cost-meter', version: '1.7.28', active: true },
-  { name: 'dsh-rule-engine', version: '0.6.4', active: true },
+  { name: 'dsh-cost-meter', version: '1.7.28', active: false }, // peer range excludes this baseline
+  { name: 'dsh-rule-engine', version: '0.6.4', active: false }, // peer range excludes this baseline
   {
     // `dsh-rule-engine`'s bundle patch carries an `include` row for this client half, so
     // the rule-engine bundle fails to load with ERR_MODULE_NOT_FOUND unless the package is
@@ -174,8 +176,8 @@ const ALL_PLUGINS: readonly BundledPlugin[] = [
     // was verified mounted here on that version.
     name: '@goodandready/dsh-time-machine',
     version: '0.1.22',
-    active: true,
-  },
+    active: false,
+  }, // peer range excludes this baseline
   {
     // An IDE-style Git panel in the Web GUI: branch and history overview, uncommitted changes
     // with commit and amend, diff stats, and a branch marker in the input bar.
@@ -373,7 +375,7 @@ const ALL_PLUGINS: readonly BundledPlugin[] = [
   { name: 'dsh-rigorquant', version: '0.7.0', active: true },
   { name: '@copylee/dsh-academic', version: '0.5.1', active: true },
   { name: 'dsh-freecad', version: '0.4.2', active: true },
-  { name: '@v587d/capital-generation', version: '2.14.1', active: true },
+  { name: '@v587d/capital-generation', version: '2.14.1', active: false }, // peer range excludes this baseline
   { name: 'dsh-term-explainer', version: '1.3.0', active: true },
   { name: '@ericwang1358/dsh-daily-flashcard', version: '3.6.2', active: true },
   { name: 'dsh-plugin-rea', version: '2.0.13', active: true },
@@ -389,9 +391,9 @@ const ALL_PLUGINS: readonly BundledPlugin[] = [
   { name: 'dsh-notify-me', version: '1.17.0', active: true },
   { name: 'dsh-blender', version: '0.2.4', active: true },
   { name: '@linxin666/dsh-pet', version: '0.4.12', active: true },
-  { name: 'dsh-scholar-suite', version: '0.1.0', spec: 'file:plugins/dsh-scholar-suite-0.1.0.tgz', active: true },
+  { name: 'dsh-scholar-suite', version: '0.1.0', spec: 'file:plugins/dsh-scholar-suite-0.1.0.tgz', active: false }, // peer range excludes this baseline
   { name: '@openmaic/dsh-openmaic', version: '0.4.0', spec: 'file:plugins/openmaic-dsh-openmaic-0.4.0.tgz', active: true },
-  { name: '@xiaoyuink/dsh-image-vision', version: '2.9.2', spec: 'file:plugins/xiaoyuink-dsh-image-vision-2.9.2.tgz', active: true },
+  { name: '@xiaoyuink/dsh-image-vision', version: '2.9.2', spec: 'file:plugins/xiaoyuink-dsh-image-vision-2.9.2.tgz', active: false }, // peer range excludes this baseline
   { name: 'dsh-chem-ui', version: '0.0.2', spec: 'file:plugins/dsh-chem-ui-0.0.2.tgz', active: true },
   { name: 'dsh-ai-courses', version: '0.1.6', spec: 'file:plugins/dsh-ai-courses-0.1.6.tgz', active: true },
   // The 鲸鱼娘 sticker pack. It used to be added to the seed after the install (the seed patch
