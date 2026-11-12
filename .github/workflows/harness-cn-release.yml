@@ -54,7 +54,7 @@ jobs:
     steps:
       # The version this release publishes is read from tauri.conf.json, so the tag has to sit on a
       # commit that carries it; a shallow checkout is enough because nothing here reads history.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -138,7 +138,7 @@ jobs:
       group: harness-cn-release
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
