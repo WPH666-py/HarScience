@@ -146,7 +146,7 @@ jobs:
         with:
           node-version: ${{ env.PRIMARY_NODE_VERSION }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: harness-cn-${{ needs.package.outputs.version }}
           path: dist/release
