@@ -327,9 +327,48 @@ fn open_in_browser(target: &tauri::Url) {
 ///
 /// The single-instance claim belongs to this process, so it has to be given up before the
 /// replacement starts; otherwise the new process sees a running shell and leaves.
+/// Argument a replacement process carries: the id of the process it replaces.
+const RELAUNCH_AFTER: &str = "--relaunch-after";
+
+/// Process id named by `--relaunch-after`, when this launch is a replacement.
+fn predecessor_pid() -> Option<u32> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == RELAUNCH_AFTER {
+            return args.next().and_then(|value| value.parse().ok());
+        }
+    }
+    None
+}
+
+/// Wait for the process this launch replaces to end before any window system starts.
+///
+/// A relaunch is spawned while the process it replaces is still running, and that process still
+/// owns the WebView2 user data folder — directly, and through the browser processes it started.
+/// Creating the environment under a busy folder fails with `0x800700AA` (the resource is in use)
+/// and leaves the replacement window blank. The wait is bounded: a predecessor that never exits
+/// must not wedge the launch, and a launch that is not a replacement costs nothing.
+fn wait_for_predecessor() {
+    let Some(pid) = predecessor_pid() else { return };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && platform::process_running(pid) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The browser processes outlive their parent by a moment, and the folder stays locked until
+    // they are gone. The job object kills them with the process, so this grace is short.
+    std::thread::sleep(Duration::from_millis(400));
+}
+
 fn restart_shell(app: &AppHandle) {
     platform::release_single_instance();
-    match std::env::current_exe().map(|exe| Command::new(exe).spawn()) {
+    let spawned = std::env::current_exe().map(|exe| {
+        Command::new(exe)
+            .arg(RELAUNCH_AFTER)
+            .arg(std::process::id().to_string())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+    });
+    match spawned {
         Ok(Ok(_)) => {
             // This process is being replaced, so the launch guard must not hold it alive.
             QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -871,6 +910,9 @@ fn main() {
         platform::focus_running_instance();
         return;
     }
+    // A replacement process must not start its window system while the process it replaces still
+    // holds the WebView2 user data folder.
+    wait_for_predecessor();
     // Created before the window loop starts so a second launch always finds the event to signal.
     platform::create_show_event();
     let built = tauri::Builder::default()

@@ -12,7 +12,7 @@ use std::process::{Child, Command};
 use std::sync::Mutex;
 
 use crate::product;
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, WAIT_TIMEOUT};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
     JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -225,6 +225,31 @@ fn wide(text: &str) -> Vec<u16> {
 /// before it starts the replacement, and a replacement that found the slot still taken would
 /// exit immediately and leave the user with nothing.
 /// @returns whether this process is the one that owns the slot.
+/// `SYNCHRONIZE` access right, which waiting on a process handle requires.
+///
+/// `windows-sys` does not export it beside the other process access rights this file imports.
+const SYNCHRONIZE: u32 = 0x0010_0000;
+
+/// Whether a process with this id is still running.
+///
+/// A relaunch uses it to wait for the process it replaces. That process owns the WebView2 user
+/// data folder until it exits, and creating a second environment under the same folder fails with
+/// `0x800700AA` — the resource is in use — which is what leaves the replacement window blank.
+pub fn process_running(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+    if handle.is_null() {
+        // A process that cannot be opened has ended, or belongs to somebody this shell may not
+        // inspect; either way it is not a reason to keep waiting.
+        return false;
+    }
+    let state = unsafe { WaitForSingleObject(handle, 0) };
+    unsafe { CloseHandle(handle) };
+    state == WAIT_TIMEOUT
+}
+
 pub fn claim_single_instance() -> bool {
     let name = wide(&instance_mutex());
     // `CreateMutexW` reports "somebody else already owns this name" through the thread's
