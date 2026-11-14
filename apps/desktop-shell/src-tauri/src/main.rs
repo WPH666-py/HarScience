@@ -412,7 +412,14 @@ fn apply_handshake(app: &AppHandle, message: Handshake) {
                 let _ = splash.destroy();
             }
             install_menu(app);
-            open_window(app, MAIN, format!("{}/", origin(port)), PRODUCT_NAME, 1280.0, 840.0, true);
+            if let Some(window) = open_window(app, MAIN, format!("{}/", origin(port)), PRODUCT_NAME, 1280.0, 840.0, true) {
+                // A window created while another application is in the foreground is not painted
+                // until it is activated, and a WebView2 window in that state shows black for as
+                // long as it stays unactivated. Showing and focusing it is what triggers the first
+                // paint, so a launch that lands behind something still opens its workspace.
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
             if needs_api_key {
                 open_window(
                     app,
